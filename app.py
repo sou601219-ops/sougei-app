@@ -1593,11 +1593,11 @@ def _parse_calendar_sheet(
         name = str(name_val).strip()
 
         # スキップ: タイトル行・凡例行・ヘッダー行・店舗区切り行
+        # スキップ: タイトル・凡例・ヘッダー行のみ（絵文字で始まる行）
+        # ※「（仮）」付き名前や21文字以上の名前も正しく読めるよう条件を絞る
         SKIP_KEYWORDS = ["🏠", "📅", "📋", "【入力", "スタッフ シフト", "利用者 月間",
                          "スタッフ名", "利用者氏名", "氏名"]
         if any(kw in name for kw in SKIP_KEYWORDS):
-            continue
-        if name.endswith("店") or "（" in name or len(name) > 20:
             continue
         # ♿プレフィックスを除去
         name = name.replace("♿ ", "").replace("♿", "").strip()
