@@ -1020,6 +1020,63 @@ def get_demo_data() -> tuple[list[User], list[Vehicle], list[Staff]]:
 # Excel カレンダー 書き込み（v4: プロ仕様レイアウト）
 # ==============================================================
 
+def build_demo_calendar(
+    users: list[User],
+    staff: list[Staff],
+    year:  int = 2026,
+    month: int = 4,
+) -> dict:
+    """
+    デモ用の月間カレンダーデータを生成する。
+    get_sample_excel と同じ「時間直接入力」形式でメモリ上に構築し、
+    extract_for_date に渡せる dict 形式で返す。
+
+    戻り値フォーマット:
+      {
+        "staff": { スタッフ名: { "YYYY-MM-DD": (start_min, end_min) or None } },
+        "users": { 利用者名:   { "YYYY-MM-DD": (start_min, end_min) or None } },
+        "year": year, "month": month
+      }
+    """
+    import calendar as cal_mod
+    _, days_in_month = cal_mod.monthrange(year, month)
+    dates = [datetime.date(year, month, d) for d in range(1, days_in_month + 1)]
+
+    staff_cal: dict = {}
+    for s in staff:
+        schedule: dict = {}
+        for dt in dates:
+            is_sun = dt.weekday() == 6
+            if is_sun or not s.can_drive:
+                schedule[dt.strftime("%Y-%m-%d")] = None  # 日曜・運転不可は休み
+            else:
+                # シフト時間をデフォルト値として設定
+                ss = s.shift_start if s.shift_start is not None else 480
+                se = s.shift_end   if s.shift_end   is not None else 1140
+                schedule[dt.strftime("%Y-%m-%d")] = (ss, se)
+        staff_cal[s.name] = schedule
+
+    users_cal: dict = {}
+    for u in users:
+        schedule = {}
+        for dt in dates:
+            is_sat = dt.weekday() == 5
+            is_sun = dt.weekday() == 6
+            if is_sat or is_sun:
+                schedule[dt.strftime("%Y-%m-%d")] = None  # 土日は休み
+            else:
+                # 迎え: 08:00 出発 → pickup_latest まで
+                schedule[dt.strftime("%Y-%m-%d")] = (480, u.pickup_latest)
+        users_cal[u.name] = schedule
+
+    return {
+        "staff":  staff_cal,
+        "users":  users_cal,
+        "year":   year,
+        "month":  month,
+    }
+
+
 def _write_calendar_sheet_staff(
     wb,
     staff:  list[Staff],
