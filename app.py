@@ -2533,8 +2533,50 @@ def main():
             } for s in all_staff]), use_container_width=True, hide_index=True)
         with t4:
             if calendar_df is not None:
-                st.dataframe(calendar_df, use_container_width=True)
-                st.caption(f"カレンダー: {len(calendar_df)}日分 / 列数: {len(calendar_df.columns)}")
+                # calendar_df は v4以降 dict 型（{"staff":..., "users":..., "year":..., "month":...}）
+                year_c  = calendar_df.get("year",  "?")
+                month_c = calendar_df.get("month", "?")
+                sc      = calendar_df.get("staff", {})
+                uc      = calendar_df.get("users", {})
+                st.caption(
+                    f"📅 {year_c}年{month_c}月　"
+                    f"スタッフ: **{len(sc)}名**分　利用者: **{len(uc)}名**分"
+                )
+                col_s, col_u = st.columns(2)
+                with col_s:
+                    st.markdown("**スタッフ カレンダー**")
+                    if sc:
+                        sample_name = next(iter(sc))
+                        sample_days = list(sc[sample_name].items())[:7]
+                        rows = [
+                            {"日付": d,
+                             "時間": f"{min_to_hhmm(v[0])}〜{min_to_hhmm(v[1])}" if v else "休み"}
+                            for d, v in sample_days
+                        ]
+                        st.caption(f"（{sample_name} の最初の7日間）")
+                        st.dataframe(
+                            pd.DataFrame(rows),
+                            use_container_width=True, hide_index=True
+                        )
+                    else:
+                        st.info("スタッフカレンダーデータなし")
+                with col_u:
+                    st.markdown("**利用者 カレンダー**")
+                    if uc:
+                        sample_name = next(iter(uc))
+                        sample_days = list(uc[sample_name].items())[:7]
+                        rows = [
+                            {"日付": d,
+                             "時間": f"{min_to_hhmm(v[0])}〜{min_to_hhmm(v[1])}" if v else "欠席"}
+                            for d, v in sample_days
+                        ]
+                        st.caption(f"（{sample_name} の最初の7日間）")
+                        st.dataframe(
+                            pd.DataFrame(rows),
+                            use_container_width=True, hide_index=True
+                        )
+                    else:
+                        st.info("利用者カレンダーデータなし")
             else:
                 st.info("月間カレンダーシートが読み込まれていません")
 
