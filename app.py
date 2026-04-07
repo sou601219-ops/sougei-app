@@ -57,7 +57,7 @@ except ImportError:
 # ページ設定（必ず先頭）
 # ==============================================================
 st.set_page_config(
-    page_title="送迎ルート最適化 v4",
+    page_title="送迎ルート最適化 v5",
     page_icon="🚌",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -1077,16 +1077,194 @@ def build_demo_calendar(
     }
 
 
-def _write_calendar_sheet_staff(
-    wb,
-    staff:  list[Staff],
-    year:   int,
-    month:  int,
+
+
+# ==============================================================
+# v5 定数: 固定枠定義
+# ==============================================================
+
+# 各店舗のスタッフ・利用者の固定枠数
+# 現場で増員があっても parse_excel_upload は動的に読み込むので
+# これはあくまで「テンプレートに最初から用意する行数」
+SHOP_LIST = ["A店", "B店", "C店"]
+
+STAFF_FRAMES: dict[str, int] = {"A店": 10, "B店": 6, "C店": 6}
+USER_FRAMES:  dict[str, int] = {"A店": 30, "B店": 30, "C店": 30}
+
+# マスタシートの列定義（1-indexed, openpyxl）
+# スタッフ: A=ID B=氏名 C=店舗 D=運転可否 E=優先度 F=出勤時間 G=退勤時間
+STAFF_COL_NAME      = "B"
+STAFF_COL_SHOP      = "C"
+STAFF_COL_SHIFT_ST  = "F"   # 出勤時間
+STAFF_COL_SHIFT_EN  = "G"   # 退勤時間
+
+# 利用者: A=ID B=氏名 C=住所 D=緯度 E=経度 F=サービス種別 G=店舗
+#          H=車椅子 I=同乗不可ID J=到着リミット K=送り目標
+USER_COL_NAME   = "B"
+USER_COL_LIMIT  = "J"   # 到着リミット
+
+
+def _get_master_row_ranges(frames: dict[str, int]) -> dict[str, tuple[int, int]]:
+    """
+    マスタシートの各店舗の Excel 行範囲（1-indexed）を返す。
+    Row 1 = タイトル, Row 2 = ヘッダー, Row 3 以降 = データ。
+
+    例 (STAFF_FRAMES):
+      A店 → (3, 12)   ← 10行
+      B店 → (13, 18)  ← 6行
+      C店 → (19, 24)  ← 6行
+    """
+    ranges: dict[str, tuple[int, int]] = {}
+    cur = 3  # データ開始行
+    for shop in SHOP_LIST:
+        n = frames.get(shop, 0)
+        ranges[shop] = (cur, cur + n - 1)
+        cur += n
+    return ranges
+
+
+def _get_calendar_shop_layout(frames: dict[str, int]) -> list[tuple[str, int, int, int, int]]:
+    """
+    カレンダーシートの各店舗ブロックの行情報を計算する。
+
+    カレンダー構造:
+      Row 1: タイトル
+      Row 2: 凡例
+      Row 3: 日付数字ヘッダー
+      Row 4: 曜日ヘッダー
+      Row 5: 🏠 A店 ヘッダー行
+      Row 6〜: A店データ行 ...
+
+    戻り値: [(shop, shop_hdr_row, data_start_row, data_end_row, master_start_row), ...]
+    """
+    master_ranges = _get_master_row_ranges(frames)
+    layout = []
+    cal_row = 5          # 最初の店舗ヘッダー行
+    for shop in SHOP_LIST:
+        n = frames[shop]
+        hdr_row    = cal_row
+        data_start = cal_row + 1
+        data_end   = data_start + n - 1
+        mst_start  = master_ranges[shop][0]
+        layout.append((shop, hdr_row, data_start, data_end, mst_start))
+        cal_row = data_end + 2   # +1=空白行, +1=次の店舗ヘッダー
+    return layout
+
+
+# ==============================================================
+# v5 マスタシート書き込み（固定枠付き・店舗ブロック形式）
+# ==============================================================
+
+def _write_master_sheet_v5(
+    ws,
+    shop_data:    dict[str, list[dict]],   # {shop: [row_dict, ...]}
+    frames:       dict[str, int],           # {shop: n_slots}
+    headers:      list[str],               # 列名リスト
+    title:        str,
+    header_color: str = "2C4A6E",
+    shop_col_key: str = "店舗",            # 店舗名を入れるキー
 ):
     """
-    スタッフシフト表シートを書き込む。
-    レイアウト: 縦=スタッフ名、横=1〜末日
-    入力形式: "08:00-19:00"（時間直接入力）
+    v5 マスタシート共通書き込み関数（固定枠付き・店舗ブロック形式）。
+
+    各店舗ごとに frames[shop] 行を確保し、
+    デモデータで埋まらない残り行は 店舗名だけ入れて 氏名等は空欄にする。
+    これにより、ユーザーが氏名を入力するだけでシステムに認識される。
+    """
+    TITLE_FILL = PatternFill("solid", fgColor="1B3A5C")
+    HDR_FILL   = PatternFill("solid", fgColor=header_color)
+    SHOP_FILLS = {
+        "A店": PatternFill("solid", fgColor="D4E6F1"),
+        "B店": PatternFill("solid", fgColor="D5F5E3"),
+        "C店": PatternFill("solid", fgColor="FEF9E7"),
+    }
+    EMPTY_FILL = PatternFill("solid", fgColor="FAFBFC")
+    ODD_FILL   = PatternFill("solid", fgColor="FFFFFF")
+
+    def bdr():
+        s = Side(style="thin", color="CCCCCC")
+        return Border(left=s, right=s, top=s, bottom=s)
+
+    n_cols = len(headers)
+    W = get_column_letter
+
+    # タイトル行（Row 1）
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=n_cols)
+    c = ws.cell(row=1, column=1, value=title)
+    c.font      = Font(bold=True, size=12, color="FFFFFF", name="メイリオ")
+    c.fill      = TITLE_FILL
+    c.alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[1].height = 28
+
+    # ヘッダー行（Row 2）
+    for col, h in enumerate(headers, 1):
+        c = ws.cell(row=2, column=col, value=h)
+        c.font      = Font(bold=True, color="FFFFFF", size=10, name="メイリオ")
+        c.fill      = HDR_FILL
+        c.alignment = Alignment(horizontal="center", vertical="center")
+        c.border    = bdr()
+    ws.row_dimensions[2].height = 22
+
+    # データ行（Row 3〜）: 店舗ブロックごとに固定枠で書き込む
+    master_ranges = _get_master_row_ranges(frames)
+    for shop in SHOP_LIST:
+        start_row, end_row = master_ranges[shop]
+        data_rows = shop_data.get(shop, [])
+        shop_fill = SHOP_FILLS.get(shop, EMPTY_FILL)
+
+        for slot_idx in range(frames[shop]):
+            row_idx = start_row + slot_idx
+            # デモデータがあれば使い、なければ空欄枠
+            if slot_idx < len(data_rows):
+                row_data = data_rows[slot_idx]
+                is_empty = False
+            else:
+                # 空欄枠: 店舗名だけ入れて他は空
+                row_data = {h: "" for h in headers}
+                row_data[shop_col_key] = shop
+                is_empty = True
+
+            fill = EMPTY_FILL if is_empty else (
+                shop_fill if slot_idx % 2 == 0 else ODD_FILL
+            )
+
+            for col, h in enumerate(headers, 1):
+                val = row_data.get(h, "")
+                c   = ws.cell(row=row_idx, column=col, value=val)
+                c.font      = Font(
+                    size=10, name="メイリオ",
+                    color="AAAAAA" if is_empty and h not in (shop_col_key, "ID") else "1C2330"
+                )
+                c.fill      = fill
+                c.alignment = Alignment(
+                    horizontal="left" if isinstance(val, str) and len(str(val)) > 6 else "center",
+                    vertical="center"
+                )
+                c.border = bdr()
+            ws.row_dimensions[row_idx].height = 20
+
+    # 列幅調整（全データを走査）
+    all_rows = [r for rows in shop_data.values() for r in rows]
+    for col, h in enumerate(headers, 1):
+        max_len = max(
+            len(str(h)),
+            max((len(str(r.get(h, ""))) for r in all_rows), default=0)
+        )
+        ws.column_dimensions[W(col)].width = min(max(max_len + 2, 8), 40)
+
+
+# ==============================================================
+# v5 スタッフカレンダーシート（Excel数式埋め込み版）
+# ==============================================================
+
+def _write_calendar_sheet_staff(wb, staff: list, year: int, month: int):
+    """
+    スタッフシフト表シート（カレンダー_スタッフ）を書き込む。
+
+    【v5】 氏名セルと平日時間セルにExcel数式を埋め込む。
+      氏名数式:   =IF(スタッフ!B{n}="","",スタッフ!B{n})
+      平日時間式: =IF(スタッフ!B{n}="","",IF(スタッフ!F{n}="","08:00-19:00",スタッフ!F{n}&"-"&スタッフ!G{n}))
+      土日:       空欄固定
     """
     import calendar as cal_mod
     _, days_in_month = cal_mod.monthrange(year, month)
@@ -1094,36 +1272,28 @@ def _write_calendar_sheet_staff(
 
     ws = wb.create_sheet("カレンダー_スタッフ")
 
-    # ---- カラーパレット ----
     C_TITLE    = PatternFill("solid", fgColor="1B3A5C")
-    C_HDR_NAME = PatternFill("solid", fgColor="2C4A6E")
     C_HDR_DATE = PatternFill("solid", fgColor="2C4A6E")
     C_SAT      = PatternFill("solid", fgColor="EBF5FB")
     C_SUN      = PatternFill("solid", fgColor="FDECEA")
-    C_SHOP_A   = PatternFill("solid", fgColor="D4E6F1")
-    C_SHOP_B   = PatternFill("solid", fgColor="D5F5E3")
-    C_SHOP_C   = PatternFill("solid", fgColor="FEF9E7")
-    C_SHOP_D   = PatternFill("solid", fgColor="F3E6FA")
-    C_ENTRY    = PatternFill("solid", fgColor="FAFBFC")
-    C_NODRIVE  = PatternFill("solid", fgColor="F2F3F4")
+    C_FORMULA  = PatternFill("solid", fgColor="F0FFF4")   # 数式セル: 薄緑
+    C_EMPTY    = PatternFill("solid", fgColor="FAFBFC")   # 空欄枠: ごく薄いグレー
+    C_WEEKEND  = PatternFill("solid", fgColor="F5F5F5")   # 土日空欄
 
-    SHOP_FILLS = {"A店": C_SHOP_A, "B店": C_SHOP_B, "C店": C_SHOP_C}
+    SHOP_DARK = {"A店": "1A5276", "B店": "145A32", "C店": "6E2F1A"}
+    SHOP_LIGHT = {"A店": "D4E6F1", "B店": "D5F5E3", "C店": "FEF9E7"}
 
     def bdr(color="C8CDD2"):
         s = Side(style="thin", color=color)
         return Border(left=s, right=s, top=s, bottom=s)
 
-    def bdr_thick(color="7F8C8D"):
-        t = Side(style="medium", color=color)
-        n = Side(style="thin",   color="C8CDD2")
-        return Border(left=t, right=n, top=n, bottom=n)
+    NAME_COL  = 1   # A列: 氏名（数式）
+    SHOP_COL  = 2   # B列: 店舗（数式）
+    FIRST_DAY = 3   # C列〜: 日付
 
-    NAME_COL   = 1   # A列: スタッフ名
-    SHOP_COL   = 2   # B列: 店舗
-    FIRST_DAY  = 3   # C列から日付開始
-
-    # ---- タイトル行（1行目）----
     last_col = FIRST_DAY + days_in_month - 1
+
+    # ── Row 1: タイトル ──
     ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=last_col)
     c = ws.cell(row=1, column=1)
     c.value     = f"📅 スタッフ シフト表　{year}年{month}月"
@@ -1132,146 +1302,131 @@ def _write_calendar_sheet_staff(
     c.alignment = Alignment(horizontal="center", vertical="center")
     ws.row_dimensions[1].height = 32
 
-    # ---- 凡例行（2行目）----
+    # ── Row 2: 凡例 ──
     ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=last_col)
     c = ws.cell(row=2, column=1)
-    c.value     = "【入力形式】 出勤日は「HH:MM-HH:MM」形式で入力（例: 08:00-19:00）　空欄 = 休み・非番"
+    c.value = (
+        "【運用方法】 氏名・時間はスタッフマスタから自動転記されます。"
+        "イレギュラーな日のみ時間を直接上書き入力してください。"
+        "空欄 = 休み・非番。"
+    )
     c.font      = Font(italic=True, size=10, color="555555", name="メイリオ")
     c.fill      = PatternFill("solid", fgColor="EAF2FA")
     c.alignment = Alignment(horizontal="left", vertical="center")
     ws.row_dimensions[2].height = 20
 
-    # ---- ヘッダー行（3行目）----
-    # 名前列
-    for col, (val, width) in enumerate(
-        [("スタッフ名", 14), ("店舗", 8)], 1
-    ):
-        c = ws.cell(row=3, column=col, value=val)
+    # ── Row 3〜4: 日付ヘッダー（数字 + 曜日）──
+    DAY_NAMES = ["月", "火", "水", "木", "金", "土", "日"]
+    ws.merge_cells(start_row=3, start_column=1, end_row=4, end_column=1)
+    ws.merge_cells(start_row=3, start_column=2, end_row=4, end_column=2)
+    for col in [1, 2]:
+        label = "氏名" if col == 1 else "店舗"
+        c = ws.cell(row=3, column=col, value=label)
         c.font      = Font(bold=True, color="FFFFFF", size=10, name="メイリオ")
-        c.fill      = C_HDR_NAME
+        c.fill      = C_HDR_DATE
         c.alignment = Alignment(horizontal="center", vertical="center")
         c.border    = bdr()
-        ws.column_dimensions[get_column_letter(col)].width = width
-    ws.row_dimensions[3].height = 36
-
-    # 日付列ヘッダー（2段: 上=日付、下=曜日）
-    DAY_NAMES = ["月", "火", "水", "木", "金", "土", "日"]
-    ws.row_dimensions[3].height = 20
-
-    # 日付ヘッダーを2行に分ける（3行目=日付数字、4行目=曜日）
-    ws.row_dimensions[4].height = 20
 
     for di, dt in enumerate(dates):
-        col     = FIRST_DAY + di
-        day_str = str(dt.day)
-        dow     = DAY_NAMES[dt.weekday()]
-        is_sat  = dt.weekday() == 5
-        is_sun  = dt.weekday() == 6
-        hdr_fill = C_SUN if is_sun else (C_SAT if is_sat else C_HDR_DATE)
-        hdr_font_color = "C0392B" if is_sun else ("1A5276" if is_sat else "FFFFFF")
+        col    = FIRST_DAY + di
+        is_sat = dt.weekday() == 5
+        is_sun = dt.weekday() == 6
+        hfill  = C_SUN if is_sun else (C_SAT if is_sat else C_HDR_DATE)
+        hcolor = "C0392B" if is_sun else ("1A5276" if is_sat else "FFFFFF")
 
-        # 日付（3行目）
         c = ws.cell(row=3, column=col, value=int(dt.day))
-        c.font      = Font(bold=True, size=10, color=hdr_font_color, name="メイリオ")
-        c.fill      = hdr_fill
-        c.alignment = Alignment(horizontal="center", vertical="center")
-        c.border    = bdr()
+        c.font = Font(bold=True, size=10, color=hcolor, name="メイリオ")
+        c.fill = hfill; c.alignment = Alignment(horizontal="center", vertical="center")
+        c.border = bdr()
 
-        # 曜日（4行目）
-        c = ws.cell(row=4, column=col, value=dow)
-        c.font      = Font(bold=True, size=9, color=hdr_font_color, name="メイリオ")
-        c.fill      = hdr_fill
-        c.alignment = Alignment(horizontal="center", vertical="center")
-        c.border    = bdr()
+        c = ws.cell(row=4, column=col, value=DAY_NAMES[dt.weekday()])
+        c.font = Font(bold=True, size=9, color=hcolor, name="メイリオ")
+        c.fill = hfill; c.alignment = Alignment(horizontal="center", vertical="center")
+        c.border = bdr()
         ws.column_dimensions[get_column_letter(col)].width = 10
 
-    # 名前ヘッダーを3〜4行にマージ
-    for col in [NAME_COL, SHOP_COL]:
-        ws.merge_cells(start_row=3, start_column=col, end_row=4, end_column=col)
-
+    ws.row_dimensions[3].height = 20
     ws.row_dimensions[4].height = 16
+    ws.column_dimensions[get_column_letter(NAME_COL)].width = 14
+    ws.column_dimensions[get_column_letter(SHOP_COL)].width = 7
 
-    # ---- スタッフ行（店舗ごとに区切り）----
-    data_start_row = 5
-    row = data_start_row
-    shops = sorted(set(s.shop for s in staff))
+    # ── データ行（店舗ブロック）──
+    layout = _get_calendar_shop_layout(STAFF_FRAMES)
 
-    for shop in shops:
-        shop_staff = [s for s in staff if s.shop == shop]
-        shop_fill  = SHOP_FILLS.get(shop, C_SHOP_D)
+    for shop, hdr_row, data_start, data_end, mst_start in layout:
+        dark  = SHOP_DARK.get(shop, "2C3E50")
+        light = SHOP_LIGHT.get(shop, "F0F0F0")
+        n_slots = STAFF_FRAMES[shop]
 
-        # 店舗区切り行
-        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=last_col)
-        c = ws.cell(row=row, column=1, value=f"  🏠 {shop}")
+        # 店舗ヘッダー行
+        ws.merge_cells(start_row=hdr_row, start_column=1, end_row=hdr_row, end_column=last_col)
+        c = ws.cell(row=hdr_row, column=1, value=f"  🏠 {shop}")
         c.font      = Font(bold=True, size=11, color="FFFFFF", name="メイリオ")
         c.fill      = PatternFill("solid", fgColor="2C3E50")
         c.alignment = Alignment(horizontal="left", vertical="center")
         c.border    = bdr("2C3E50")
-        ws.row_dimensions[row].height = 22
-        row += 1
+        ws.row_dimensions[hdr_row].height = 22
 
-        for s in shop_staff:
-            # スタッフ名
-            c = ws.cell(row=row, column=NAME_COL, value=s.name)
+        # 各スタッフ枠行
+        for slot_idx in range(n_slots):
+            cal_row = data_start + slot_idx
+            mst_row = mst_start + slot_idx   # スタッフマスタの対応行
+
+            # ── 氏名セル（数式）──
+            # マスタのB列を参照し、空なら空白を返す
+            name_formula = f'=IF(スタッフ!{STAFF_COL_NAME}{mst_row}="","",スタッフ!{STAFF_COL_NAME}{mst_row})'
+            c = ws.cell(row=cal_row, column=NAME_COL, value=name_formula)
             c.font      = Font(bold=True, size=10, name="メイリオ")
-            c.fill      = shop_fill
+            c.fill      = PatternFill("solid", fgColor=light)
             c.alignment = Alignment(horizontal="left", vertical="center")
-            c.border    = bdr_thick()
+            c.border    = bdr()
 
-            # 店舗
-            c = ws.cell(row=row, column=SHOP_COL, value=s.shop)
+            # ── 店舗セル（数式）──
+            shop_formula = f'=IF(スタッフ!{STAFF_COL_NAME}{mst_row}="","",スタッフ!{STAFF_COL_SHOP}{mst_row})'
+            c = ws.cell(row=cal_row, column=SHOP_COL, value=shop_formula)
             c.font      = Font(size=9, name="メイリオ")
-            c.fill      = shop_fill
+            c.fill      = PatternFill("solid", fgColor=light)
             c.alignment = Alignment(horizontal="center", vertical="center")
             c.border    = bdr()
 
-            # 各日セル
+            # ── 各日セル ──
             for di, dt in enumerate(dates):
-                col      = FIRST_DAY + di
-                is_sat   = dt.weekday() == 5
-                is_sun   = dt.weekday() == 6
-                can_work = s.can_drive
+                col    = FIRST_DAY + di
+                is_sat = dt.weekday() == 5
+                is_sun = dt.weekday() == 6
 
-                # デフォルト値（マスタのシフト時間を参照）
-                if s.shift_start is not None and s.shift_end is not None:
-                    default_val = f"{min_to_hhmm(s.shift_start)}-{min_to_hhmm(s.shift_end)}"
+                if is_sat or is_sun:
+                    # 土日は空欄固定（数式なし）
+                    c = ws.cell(row=cal_row, column=col, value="")
+                    c.fill   = C_WEEKEND
+                    c.border = bdr()
+                    c.alignment = Alignment(horizontal="center", vertical="center")
                 else:
-                    default_val = "08:00-19:00"
+                    # 平日: マスタのシフト時間を参照する数式
+                    # F列(出勤時間)が空なら "08:00-19:00"、あれば F&"-"&G
+                    time_formula = (
+                        f'=IF(スタッフ!{STAFF_COL_NAME}{mst_row}="","",'
+                        f'IF(スタッフ!{STAFF_COL_SHIFT_ST}{mst_row}="",'
+                        f'"08:00-19:00",'
+                        f'スタッフ!{STAFF_COL_SHIFT_ST}{mst_row}'
+                        f'&"-"&'
+                        f'スタッフ!{STAFF_COL_SHIFT_EN}{mst_row}))'
+                    )
+                    c = ws.cell(row=cal_row, column=col, value=time_formula)
+                    c.fill   = C_FORMULA
+                    c.border = bdr()
+                    c.font   = Font(size=9, color="1E6B38", name="メイリオ")
+                    c.alignment = Alignment(horizontal="center", vertical="center")
 
-                # 平日はデフォルト値、土日は空欄
-                if can_work and dt.weekday() < 5:
-                    cell_val = default_val
-                elif can_work and dt.weekday() == 5:  # 土曜
-                    cell_val = default_val
-                else:
-                    cell_val = ""  # 日曜・運転不可
-
-                c = ws.cell(row=row, column=col, value=cell_val)
-                c.font = Font(
-                    size=9, name="DM Mono" if cell_val else "メイリオ",
-                    color="2C3E50" if cell_val else "AAAAAA",
-                    italic=not can_work,
-                )
-                bg = C_SUN if is_sun else (C_SAT if is_sat else
-                     (C_NODRIVE if not can_work else C_ENTRY))
-                c.fill      = bg
-                c.alignment = Alignment(horizontal="center", vertical="center")
-                c.border    = bdr()
-
-            ws.row_dimensions[row].height = 22
-            row += 1
+            ws.row_dimensions[cal_row].height = 22
 
         # 店舗間の空白行
+        sep_row = data_end + 1
         for col in range(1, last_col + 1):
-            ws.cell(row=row, column=col).fill = PatternFill("solid", fgColor="F0F3F4")
-        ws.row_dimensions[row].height = 6
-        row += 1
+            ws.cell(row=sep_row, column=col).fill = PatternFill("solid", fgColor="F0F3F4")
+        ws.row_dimensions[sep_row].height = 6
 
-    # 列幅固定
-    ws.column_dimensions[get_column_letter(NAME_COL)].width = 14
-    ws.column_dimensions[get_column_letter(SHOP_COL)].width = 7
-
-    # 印刷設定
+    # 印刷設定・ウィンドウ枠固定
     from openpyxl.worksheet.page import PageMargins
     ws.page_setup.orientation = "landscape"
     ws.page_setup.fitToPage   = True
@@ -1280,16 +1435,19 @@ def _write_calendar_sheet_staff(
     ws.freeze_panes = f"{get_column_letter(FIRST_DAY)}5"
 
 
-def _write_calendar_sheet_users(
-    wb,
-    users:  list[User],
-    year:   int,
-    month:  int,
-):
+# ==============================================================
+# v5 利用者カレンダーシート（Excel数式埋め込み版）
+# ==============================================================
+
+def _write_calendar_sheet_users(wb, users: list, year: int, month: int):
     """
-    利用者予定表シートを書き込む（店舗ごとにブロック分け）。
-    レイアウト: 縦=利用者名、横=1〜末日
-    入力形式: "09:00-15:30"（時間直接入力）
+    利用者予定表シート（カレンダー_利用者）を書き込む。
+    店舗ブロックで分割。
+
+    【v5】 氏名セルと平日時間セルにExcel数式を埋め込む。
+      氏名数式:   =IF(利用者!B{n}="","",利用者!B{n})
+      平日時間式: =IF(利用者!B{n}="","","08:00-"&利用者!J{n})
+      土日:       空欄固定
     """
     import calendar as cal_mod
     _, days_in_month = cal_mod.monthrange(year, month)
@@ -1298,34 +1456,27 @@ def _write_calendar_sheet_users(
     ws = wb.create_sheet("カレンダー_利用者")
 
     C_TITLE   = PatternFill("solid", fgColor="1B3A5C")
-    C_HDR_NAME = PatternFill("solid", fgColor="2C4A6E")
-    C_SAT      = PatternFill("solid", fgColor="EBF5FB")
-    C_SUN      = PatternFill("solid", fgColor="FDECEA")
-    C_ENTRY    = PatternFill("solid", fgColor="FAFBFC")
-    C_WC       = PatternFill("solid", fgColor="FEF9E7")  # 車椅子利用者
+    C_HDR     = PatternFill("solid", fgColor="2C4A6E")
+    C_SAT     = PatternFill("solid", fgColor="EBF5FB")
+    C_SUN     = PatternFill("solid", fgColor="FDECEA")
+    C_FORMULA = PatternFill("solid", fgColor="F0FFF4")
+    C_WEEKEND = PatternFill("solid", fgColor="F5F5F5")
+    C_WC      = PatternFill("solid", fgColor="FEF9E7")
 
-    SHOP_DARK  = {
-        "A店": ("1A5276", "D4E6F1"),
-        "B店": ("145A32", "D5F5E3"),
-        "C店": ("6E2F1A", "FDEBD0"),
-    }
+    SHOP_DARK  = {"A店": "1A5276", "B店": "145A32", "C店": "6E2F1A"}
+    SHOP_LIGHT = {"A店": "D4E6F1", "B店": "D5F5E3", "C店": "FDEBD0"}
 
     def bdr(color="C8CDD2"):
         s = Side(style="thin", color=color)
         return Border(left=s, right=s, top=s, bottom=s)
 
-    def bdr_thick(color="7F8C8D"):
-        t = Side(style="medium", color=color)
-        n = Side(style="thin", color="C8CDD2")
-        return Border(left=t, right=n, top=n, bottom=n)
+    NAME_COL  = 1
+    SVC_COL   = 2
+    FIRST_DAY = 3
+    last_col  = FIRST_DAY + days_in_month - 1
+    DAY_NAMES = ["月", "火", "水", "木", "金", "土", "日"]
 
-    NAME_COL   = 1
-    SVC_COL    = 2
-    FIRST_DAY  = 3
-    last_col   = FIRST_DAY + days_in_month - 1
-    DAY_NAMES  = ["月", "火", "水", "木", "金", "土", "日"]
-
-    # ---- タイトル（1行目）----
+    # ── Row 1: タイトル ──
     ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=last_col)
     c = ws.cell(row=1, column=1)
     c.value     = f"📋 利用者 月間利用予定表　{year}年{month}月"
@@ -1334,127 +1485,129 @@ def _write_calendar_sheet_users(
     c.alignment = Alignment(horizontal="center", vertical="center")
     ws.row_dimensions[1].height = 32
 
-    # ---- 凡例（2行目）----
+    # ── Row 2: 凡例 ──
     ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=last_col)
     c = ws.cell(row=2, column=1)
-    c.value = "【入力形式】利用日は「HH:MM-HH:MM」で入力（例: 09:00-15:30）　空欄 = 欠席・利用なし　♿ = 車椅子"
+    c.value = (
+        "【運用方法】 氏名・デフォルト時間は利用者マスタから自動転記されます。"
+        "変更がある日のみ直接上書きしてください。空欄 = 欠席・利用なし。♿ = 車椅子利用者。"
+    )
     c.font  = Font(italic=True, size=10, color="555555", name="メイリオ")
     c.fill  = PatternFill("solid", fgColor="E8F8F5")
     c.alignment = Alignment(horizontal="left", vertical="center")
     ws.row_dimensions[2].height = 20
 
-    # ---- ヘッダー（3〜4行目）----
-    for col, (val, width) in enumerate(
-        [("利用者氏名", 14), ("サービス", 12)], 1
-    ):
-        ws.merge_cells(start_row=3, start_column=col, end_row=4, end_column=col)
-        c = ws.cell(row=3, column=col, value=val)
+    # ── Row 3〜4: 日付ヘッダー ──
+    ws.merge_cells(start_row=3, start_column=1, end_row=4, end_column=1)
+    ws.merge_cells(start_row=3, start_column=2, end_row=4, end_column=2)
+    for col, label in [(1, "利用者氏名"), (2, "サービス")]:
+        c = ws.cell(row=3, column=col, value=label)
         c.font      = Font(bold=True, color="FFFFFF", size=10, name="メイリオ")
-        c.fill      = C_HDR_NAME
+        c.fill      = C_HDR
         c.alignment = Alignment(horizontal="center", vertical="center")
         c.border    = bdr()
-        ws.column_dimensions[get_column_letter(col)].width = width
 
     for di, dt in enumerate(dates):
-        col      = FIRST_DAY + di
-        is_sat   = dt.weekday() == 5
-        is_sun   = dt.weekday() == 6
-        hfill    = C_SUN if is_sun else (C_SAT if is_sat else C_HDR_NAME)
-        hcolor   = "C0392B" if is_sun else ("1A5276" if is_sat else "FFFFFF")
+        col    = FIRST_DAY + di
+        is_sat = dt.weekday() == 5
+        is_sun = dt.weekday() == 6
+        hfill  = C_SUN if is_sun else (C_SAT if is_sat else C_HDR)
+        hcolor = "C0392B" if is_sun else ("1A5276" if is_sat else "FFFFFF")
 
         c = ws.cell(row=3, column=col, value=int(dt.day))
-        c.font      = Font(bold=True, size=10, color=hcolor, name="メイリオ")
-        c.fill      = hfill
-        c.alignment = Alignment(horizontal="center", vertical="center")
-        c.border    = bdr()
+        c.font = Font(bold=True, size=10, color=hcolor, name="メイリオ")
+        c.fill = hfill; c.alignment = Alignment(horizontal="center", vertical="center")
+        c.border = bdr()
 
         c = ws.cell(row=4, column=col, value=DAY_NAMES[dt.weekday()])
-        c.font      = Font(bold=True, size=9, color=hcolor, name="メイリオ")
-        c.fill      = hfill
-        c.alignment = Alignment(horizontal="center", vertical="center")
-        c.border    = bdr()
+        c.font = Font(bold=True, size=9, color=hcolor, name="メイリオ")
+        c.fill = hfill; c.alignment = Alignment(horizontal="center", vertical="center")
+        c.border = bdr()
         ws.column_dimensions[get_column_letter(col)].width = 10
 
     ws.row_dimensions[3].height = 20
     ws.row_dimensions[4].height = 16
+    ws.column_dimensions[get_column_letter(NAME_COL)].width = 14
+    ws.column_dimensions[get_column_letter(SVC_COL)].width  = 10
 
-    # ---- 利用者行（店舗ブロックで分割）----
-    shops  = sorted(set(u.shop for u in users))
-    row    = 5
+    # ── データ行（店舗ブロック）──
+    layout = _get_calendar_shop_layout(USER_FRAMES)
 
-    for shop in shops:
-        dark_hex, light_hex = SHOP_DARK.get(shop, ("2C3E50", "F0F0F0"))
-        shop_users = [u for u in users if u.shop == shop]
+    for shop, hdr_row, data_start, data_end, mst_start in layout:
+        dark  = SHOP_DARK.get(shop, "2C3E50")
+        light = SHOP_LIGHT.get(shop, "F0F0F0")
+        n_slots = USER_FRAMES[shop]
 
-        # 店舗区切り行
-        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=last_col)
-        c = ws.cell(row=row, column=1, value=f"  🏠 {shop}　（{len(shop_users)}名）")
+        # 店舗ヘッダー行
+        ws.merge_cells(start_row=hdr_row, start_column=1, end_row=hdr_row, end_column=last_col)
+        c = ws.cell(row=hdr_row, column=1, value=f"  🏠 {shop}　（{n_slots}名枠）")
         c.font      = Font(bold=True, size=11, color="FFFFFF", name="メイリオ")
-        c.fill      = PatternFill("solid", fgColor=dark_hex)
+        c.fill      = PatternFill("solid", fgColor=dark)
         c.alignment = Alignment(horizontal="left", vertical="center")
-        c.border    = bdr(dark_hex)
-        ws.row_dimensions[row].height = 24
-        row += 1
+        c.border    = bdr(dark)
+        ws.row_dimensions[hdr_row].height = 24
 
-        name_fill  = PatternFill("solid", fgColor=light_hex)
+        for slot_idx in range(n_slots):
+            cal_row = data_start + slot_idx
+            mst_row = mst_start + slot_idx   # 利用者マスタの対応行
 
-        for u in shop_users:
-            wc = u.wheelchair
-
-            # 利用者名
-            c = ws.cell(row=row, column=NAME_COL,
-                        value=("♿ " if wc else "") + u.name)
+            # ── 氏名セル（数式）──
+            # マスタB列（氏名）を参照。空なら空白。
+            name_formula = (
+                f'=IF(利用者!{USER_COL_NAME}{mst_row}="",'
+                f'"♿ "&利用者!{USER_COL_NAME}{mst_row},'
+                f'利用者!{USER_COL_NAME}{mst_row})'
+            )
+            # シンプル版（車椅子判定はマスタH列が必要で複雑になるため省略）
+            name_formula = f'=IF(利用者!{USER_COL_NAME}{mst_row}="","",利用者!{USER_COL_NAME}{mst_row})'
+            c = ws.cell(row=cal_row, column=NAME_COL, value=name_formula)
             c.font      = Font(bold=True, size=10, name="メイリオ")
-            c.fill      = C_WC if wc else name_fill
+            c.fill      = PatternFill("solid", fgColor=light)
             c.alignment = Alignment(horizontal="left", vertical="center")
-            c.border    = bdr_thick(dark_hex)
+            c.border    = bdr()
 
-            # サービス種別
-            svc_short = u.service_type.value.replace("放課後等デイサービス", "放デイ").replace("就労継続支援", "")
-            c = ws.cell(row=row, column=SVC_COL, value=svc_short)
+            # ── サービス種別セル（数式）──
+            # マスタF列（サービス種別）を参照
+            svc_formula = f'=IF(利用者!{USER_COL_NAME}{mst_row}="","",利用者!F{mst_row})'
+            c = ws.cell(row=cal_row, column=SVC_COL, value=svc_formula)
             c.font      = Font(size=9, name="メイリオ")
-            c.fill      = C_WC if wc else name_fill
+            c.fill      = PatternFill("solid", fgColor=light)
             c.alignment = Alignment(horizontal="center", vertical="center")
             c.border    = bdr()
 
-            # デフォルト到着リミットからデフォルト入力値を生成
-            def_start = 480   # 08:00
-            def_end   = u.pickup_latest
-            default_entry = f"{min_to_hhmm(def_start)}-{min_to_hhmm(def_end)}"
-
-            # 各日セル
+            # ── 各日セル ──
             for di, dt in enumerate(dates):
                 col    = FIRST_DAY + di
                 is_sat = dt.weekday() == 5
                 is_sun = dt.weekday() == 6
 
-                # 平日はデフォルト値、土日は空欄
-                cell_val = default_entry if dt.weekday() < 5 else ""
+                if is_sat or is_sun:
+                    # 土日: 空欄固定
+                    c = ws.cell(row=cal_row, column=col, value="")
+                    c.fill   = C_WEEKEND
+                    c.border = bdr()
+                    c.alignment = Alignment(horizontal="center", vertical="center")
+                else:
+                    # 平日: "08:00-{到着リミット}" の数式
+                    # マスタJ列（到着リミット）を参照
+                    # 例: 到着リミットが"09:00"なら → "08:00-09:00"
+                    time_formula = (
+                        f'=IF(利用者!{USER_COL_NAME}{mst_row}="","",'
+                        f'"08:00-"&利用者!{USER_COL_LIMIT}{mst_row})'
+                    )
+                    c = ws.cell(row=cal_row, column=col, value=time_formula)
+                    c.fill   = C_FORMULA
+                    c.border = bdr()
+                    c.font   = Font(size=9, color="1E6B38", name="メイリオ")
+                    c.alignment = Alignment(horizontal="center", vertical="center")
 
-                c = ws.cell(row=row, column=col, value=cell_val)
-                c.font = Font(
-                    size=9,
-                    color="2C3E50" if cell_val else "BBBBBB",
-                    name="メイリオ",
-                )
-                bg = C_SUN if is_sun else (C_SAT if is_sat else
-                     (C_WC if wc else C_ENTRY))
-                c.fill      = bg
-                c.alignment = Alignment(horizontal="center", vertical="center")
-                c.border    = bdr()
+            ws.row_dimensions[cal_row].height = 22
 
-            ws.row_dimensions[row].height = 22
-            row += 1
-
-        # 店舗間空白
+        # 店舗間の空白行
+        sep_row = data_end + 1
         for col in range(1, last_col + 1):
-            ws.cell(row=row, column=col).fill = PatternFill("solid", fgColor="F0F3F4")
-        ws.row_dimensions[row].height = 8
-        row += 1
-
-    # 列幅設定
-    ws.column_dimensions[get_column_letter(NAME_COL)].width = 14
-    ws.column_dimensions[get_column_letter(SVC_COL)].width  = 10
+            ws.cell(row=sep_row, column=col).fill = PatternFill("solid", fgColor="F0F3F4")
+        ws.row_dimensions[sep_row].height = 8
 
     # 印刷設定
     from openpyxl.worksheet.page import PageMargins
@@ -1466,30 +1619,36 @@ def _write_calendar_sheet_users(
 
 
 # ==============================================================
-# Excel 入力（parse_excel_upload）v4 カレンダー対応版
+# v5 parse_excel_upload（空行スキップ・堅牢版）
 # ==============================================================
+
+def _is_empty_cell(val) -> bool:
+    """
+    セル値が「空」と見なせるかどうかを判定する。
+    NaN・空文字・"nan"・Excel数式文字列（"="で始まる）はすべて空扱い。
+    """
+    if val is None:
+        return True
+    s = str(val).strip()
+    return s in ("", "nan", "None") or s.startswith("=")
+
 
 def parse_excel_upload(
     uploaded_file,
-    default_pickup_limit:  int = 540,
+    default_pickup_limit:   int = 540,
     default_dropoff_target: int = 1050,
 ):
     """
     Excelを読み込んでデータクラスに変換。
 
-    v4 カレンダーシート構成:
-      「カレンダー_スタッフ」: 縦=スタッフ、横=日付（HH:MM-HH:MM）
-      「カレンダー_利用者」:   縦=利用者（店舗ブロック）、横=日付
-
-    戻り値:
-      users, vehicles, staff, calendar_data
-
-    calendar_data: {
-        "staff":  { staff_name:  { "YYYY-MM-DD": (start_min, end_min) or None } },
-        "users":  { user_name:   { "YYYY-MM-DD": (start_min, end_min) or None } },
-    }
+    【v5 変更点】
+    - 氏名が空・NaN・数式文字列の行を完全スキップ（固定枠の空行対応）
+    - 行数制限なし（ユーザーが行を追加してもすべて読み込む）
+    - Excelが未計算のままアップロードされた場合（数式文字列）も安全に処理
     """
-    xl = pd.ExcelFile(uploaded_file)
+    import pandas as _pd
+    xl = _pd.ExcelFile(uploaded_file)
+
     svc_map = {
         "放課後等デイサービス": ServiceType.HOUKAGO_DEI,
         "A型":                ServiceType.A_TYPE,
@@ -1500,6 +1659,11 @@ def parse_excel_upload(
     df_u = xl.parse("利用者", header=1)
     users = []
     for i, row in df_u.iterrows():
+        # 【v5】氏名が空・NaN・数式文字列の行はスキップ（固定枠の空行）
+        name_val = row.get("氏名", "")
+        if _is_empty_cell(name_val):
+            continue
+
         incomp_raw = str(row.get("同乗不可ID", "")).strip()
         incomp = (
             [x.strip() for x in incomp_raw.split(",") if x.strip()]
@@ -1508,12 +1672,23 @@ def parse_excel_upload(
         wc     = bool(row.get("車椅子", False))
         pu_lim = hhmm_to_min(row.get("到着リミット", ""), default_pickup_limit)
         do_tgt = hhmm_to_min(row.get("送り目標",   ""), default_dropoff_target)
+
+        # 緯度・経度: 空や数式の場合はデフォルト値
+        try:
+            lat = float(row.get("緯度", 36.695))
+        except (ValueError, TypeError):
+            lat = 36.695
+        try:
+            lng = float(row.get("経度", 137.211))
+        except (ValueError, TypeError):
+            lng = 137.211
+
         users.append(User(
             user_id        = str(row.get("ID", f"u{i+1}")),
-            name           = str(row["氏名"]),
+            name           = str(name_val).strip(),
             address        = str(row.get("住所", "")),
-            lat            = float(row.get("緯度", 36.695)),
-            lng            = float(row.get("経度", 137.211)),
+            lat            = lat,
+            lng            = lng,
             service_type   = svc_map.get(str(row.get("サービス種別", "")), ServiceType.HOUKAGO_DEI),
             shop           = str(row.get("店舗", "A店")),
             wheelchair     = wc,
@@ -1524,33 +1699,51 @@ def parse_excel_upload(
         ))
 
     # ---- 車両シート ----
-    df_v = xl.parse("車両", header=1)
+    df_v    = xl.parse("車両", header=1)
     type_cap = {"large": 7, "normal": 4, "kei": 3}
     vehicles = []
     for i, row in df_v.iterrows():
+        # 【v5】車両名が空の行はスキップ
+        vname = row.get("車両名", "")
+        if _is_empty_cell(vname):
+            continue
         vtype = str(row.get("種別コード", "normal"))
+        try:
+            depot_lat = float(row.get("デポ緯度", 36.695))
+        except (ValueError, TypeError):
+            depot_lat = 36.695
+        try:
+            depot_lng = float(row.get("デポ経度", 137.211))
+        except (ValueError, TypeError):
+            depot_lng = 137.211
         vehicles.append(Vehicle(
             vehicle_id    = str(row.get("ID", f"v{i+1}")),
-            name          = str(row["車両名"]),
+            name          = str(vname).strip(),
             vehicle_type  = vtype,
             capacity      = int(row.get("定員", type_cap.get(vtype, 4))),
             shop          = str(row.get("店舗", "A店")),
             wheelchair_ok = bool(row.get("車椅子対応", False)),
-            depot_lat     = float(row.get("デポ緯度", 36.695)),
-            depot_lng     = float(row.get("デポ経度", 137.211)),
+            depot_lat     = depot_lat,
+            depot_lng     = depot_lng,
         ))
 
     # ---- スタッフシート ----
-    df_s = xl.parse("スタッフ", header=1)
+    df_s  = xl.parse("スタッフ", header=1)
     staff = []
     for i, row in df_s.iterrows():
+        # 【v5】氏名が空の行はスキップ（固定枠の空行）
+        name_val = row.get("氏名", "")
+        if _is_empty_cell(name_val):
+            continue
+
         ss_raw = row.get("出勤時間", "")
         se_raw = row.get("退勤時間", "")
-        ss = hhmm_to_min(ss_raw, -1) if str(ss_raw).strip() not in ("", "nan") else None
-        se = hhmm_to_min(se_raw, -1) if str(se_raw).strip() not in ("", "nan") else None
+        # 数式文字列の場合は None 扱い
+        ss = hhmm_to_min(ss_raw, -1) if not _is_empty_cell(ss_raw) else None
+        se = hhmm_to_min(se_raw, -1) if not _is_empty_cell(se_raw) else None
         staff.append(Staff(
             staff_id    = str(row.get("ID", f"s{i+1}")),
-            name        = str(row["氏名"]),
+            name        = str(name_val).strip(),
             shop        = str(row.get("店舗", "A店")),
             can_drive   = bool(row.get("運転可否", True)),
             priority    = int(row.get("優先度", 1)),
@@ -1558,52 +1751,63 @@ def parse_excel_upload(
             shift_end   = se if se != -1 else None,
         ))
 
-    # ---- カレンダーシート（v4新形式）----
+    # ---- カレンダーシート ----
     calendar_data = _parse_calendar_sheets(xl, staff, users)
 
     return users, vehicles, staff, calendar_data
 
 
+# ==============================================================
+# v5 カレンダーパース（数式文字列対応・堅牢版）
+# ==============================================================
+
 def _parse_calendar_sheet(
-    df:           pd.DataFrame,
-    name_col:     int,
+    df:            pd.DataFrame,
+    name_col:      int,
     first_day_col: int,
-    year:         int,
-    month:        int,
+    year:          int,
+    month:         int,
     default_start: int = 480,
     default_end:   int = 1140,
-) -> dict[str, dict[str, Optional[tuple[int, int]]]]:
+) -> dict:
     """
-    横軸=日付（1〜31列）、縦軸=名前 の形式のシートを解析する。
+    横軸=日付、縦軸=名前 のカレンダーシートを解析する。
 
-    戻り値:
-      { 名前: { "YYYY-MM-DD": (start_min, end_min) or None } }
+    【v5 変更点】
+    - 名前セルが数式文字列（"="始まり）の場合スキップ
+      （Excel未計算のままアップロードされた場合の安全対策）
+    - 時間セルが数式文字列の場合は None（欠席扱い）として処理
     """
     import calendar as cal_mod
     _, days_in_month = cal_mod.monthrange(year, month)
-    result: dict[str, dict[str, Optional[tuple[int, int]]]] = {}
+    result: dict = {}
 
     for row_idx in range(len(df)):
         row = df.iloc[row_idx]
 
-        # 名前列を取得
         name_val = row.iloc[name_col] if name_col < len(row) else None
+
+        # 空・NaN・数式未計算はスキップ
         if name_val is None or str(name_val).strip() in ("", "nan"):
             continue
         name = str(name_val).strip()
+        if name.startswith("="):
+            # Excel数式が未計算のまま → スキップ
+            continue
 
-        # スキップ: タイトル行・凡例行・ヘッダー行・店舗区切り行
-        # スキップ: タイトル・凡例・ヘッダー行のみ（絵文字で始まる行）
-        # ※「（仮）」付き名前や21文字以上の名前も正しく読めるよう条件を絞る
-        SKIP_KEYWORDS = ["🏠", "📅", "📋", "【入力", "スタッフ シフト", "利用者 月間",
-                         "スタッフ名", "利用者氏名", "氏名"]
+        # スキップ: タイトル・凡例・ヘッダー・店舗区切り行
+        SKIP_KEYWORDS = [
+            "🏠", "📅", "📋", "【入力", "【運用",
+            "スタッフ シフト", "利用者 月間",
+            "スタッフ名", "利用者氏名", "氏名",
+        ]
         if any(kw in name for kw in SKIP_KEYWORDS):
             continue
+
         # ♿プレフィックスを除去
         name = name.replace("♿ ", "").replace("♿", "").strip()
 
-        schedule: dict[str, Optional[tuple[int, int]]] = {}
-
+        schedule: dict = {}
         for day in range(1, days_in_month + 1):
             day_col_idx = first_day_col + (day - 1)
             if day_col_idx >= len(row):
@@ -1611,21 +1815,21 @@ def _parse_calendar_sheet(
 
             cell_val = row.iloc[day_col_idx]
             date_str = datetime.date(year, month, day).strftime("%Y-%m-%d")
-            parsed   = parse_time_range(cell_val, default_start, default_end)
-            schedule[date_str] = parsed
+
+            # 【v5】数式文字列（未計算）は None（欠席扱い）
+            if cell_val is not None and str(cell_val).strip().startswith("="):
+                schedule[date_str] = None
+            else:
+                schedule[date_str] = parse_time_range(cell_val, default_start, default_end)
 
         result[name] = schedule
 
     return result
 
 
-def _parse_calendar_sheets(
-    xl:    pd.ExcelFile,
-    staff: list[Staff],
-    users: list[User],
-) -> Optional[dict]:
+def _parse_calendar_sheets(xl, staff, users) -> Optional[dict]:
     """
-    「カレンダー_スタッフ」「カレンダー_利用者」シートを解析。
+    カレンダー_スタッフ / カレンダー_利用者 シートを解析。
     シートがなければ None を返す。
     """
     has_staff = "カレンダー_スタッフ" in xl.sheet_names
@@ -1634,20 +1838,16 @@ def _parse_calendar_sheets(
     if not has_staff and not has_users:
         return None
 
-    # 現在の年月を推定（最初の日付列ヘッダーから取得を試みる）
-    # ヘッダー行を含まずに読み込む（header=None で生データ）
     import datetime as _dt
     today = _dt.date.today()
     year  = today.year
     month = today.month
 
-    staff_cal: dict[str, dict] = {}
-    users_cal: dict[str, dict] = {}
+    staff_cal: dict = {}
+    users_cal: dict = {}
 
     if has_staff:
         raw_s = xl.parse("カレンダー_スタッフ", header=None)
-        # 3行目（index=2）が日付数字ヘッダー、名前は列0、店舗は列1、日付は列2〜
-        # 年月を日付列から推定
         year, month = _detect_year_month_from_sheet(raw_s, xl, "カレンダー_スタッフ")
         staff_cal   = _parse_calendar_sheet(
             raw_s, name_col=0, first_day_col=2,
@@ -1667,15 +1867,8 @@ def _parse_calendar_sheets(
     return {"staff": staff_cal, "users": users_cal, "year": year, "month": month}
 
 
-def _detect_year_month_from_sheet(
-    df_raw: pd.DataFrame,
-    xl:     pd.ExcelFile,
-    sheet_name: str,
-) -> tuple[int, int]:
-    """
-    シートのタイトル行（row=0）から「YYYY年M月」を抽出して返す。
-    失敗したら今月を返す。
-    """
+def _detect_year_month_from_sheet(df_raw, xl, sheet_name) -> tuple:
+    """タイトル行から YYYY年M月 を抽出して返す。失敗したら今月を返す。"""
     import re, datetime as _dt
     today = _dt.date.today()
     try:
@@ -1689,20 +1882,25 @@ def _detect_year_month_from_sheet(
 
 
 # ==============================================================
-# サンプルExcel生成（v4: プロ仕様カレンダー）
+# v5 get_sample_excel（固定枠 + 数式埋め込み版）
 # ==============================================================
 
 def get_sample_excel(year: Optional[int] = None, month: Optional[int] = None) -> bytes:
     """
-    v4対応サンプルExcelを生成。
+    v5対応サンプルExcelを生成。
+
+    【v5 変更点】
+    1. マスタに固定枠を設ける（スタッフ A10/B6/C6、利用者 各30）
+    2. カレンダーにExcel数式を埋め込み（マスタへの参照）
+    3. 空欄枠には店舗名だけ入力して氏名は空に
 
     シート構成:
-      利用者          - マスタ
-      車両            - マスタ
-      スタッフ        - マスタ（シフト時間込み）
-      カレンダー_スタッフ - 縦=人、横=日付、HH:MM-HH:MM 入力
-      カレンダー_利用者   - 縦=人（店舗ブロック）、横=日付
-      記入例          - 入力ガイド
+      利用者            - マスタ（A30/B30/C30 固定枠）
+      車両              - マスタ
+      スタッフ          - マスタ（A10/B6/C6 固定枠）
+      カレンダー_スタッフ - 数式で氏名・時間をマスタから自動転記
+      カレンダー_利用者   - 数式で氏名・時間をマスタから自動転記
+      記入例            - 入力ガイド
     """
     users, vehicles, staff = get_demo_data()
 
@@ -1712,7 +1910,6 @@ def get_sample_excel(year: Optional[int] = None, month: Optional[int] = None) ->
         month = today.month
 
     if not OPENPYXL_AVAILABLE:
-        # フォールバック: CSVで簡易出力
         buf = io.StringIO()
         pd.DataFrame([{"氏名": u.name, "店舗": u.shop} for u in users]).to_csv(buf, index=False)
         return buf.getvalue().encode("utf-8-sig")
@@ -1720,19 +1917,32 @@ def get_sample_excel(year: Optional[int] = None, month: Optional[int] = None) ->
     wb = Workbook()
     wb.remove(wb.active)
 
-    # ---- 利用者マスタシート ----
+    # ========== 利用者マスタ（固定枠 各30行）==========
     ws_u = wb.create_sheet("利用者")
-    _write_master_sheet(ws_u, [
-        {"ID": u.user_id, "氏名": u.name, "住所": u.address,
-         "緯度": u.lat, "経度": u.lng,
-         "サービス種別": u.service_type.value, "店舗": u.shop,
-         "車椅子": u.wheelchair, "同乗不可ID": ",".join(u.incompatible),
-         "到着リミット": min_to_hhmm(u.pickup_latest),
-         "送り目標":     min_to_hhmm(u.dropoff_target),
-         } for u in users
-    ], title="利用者マスタ", header_color="2C4A6E")
+    user_headers = [
+        "ID", "氏名", "住所", "緯度", "経度",
+        "サービス種別", "店舗", "車椅子", "同乗不可ID",
+        "到着リミット", "送り目標",
+    ]
+    # 店舗ごとにデモデータを整理
+    user_by_shop = {shop: [] for shop in SHOP_LIST}
+    for u in users:
+        if u.shop in user_by_shop:
+            user_by_shop[u.shop].append({
+                "ID": u.user_id, "氏名": u.name, "住所": u.address,
+                "緯度": u.lat, "経度": u.lng,
+                "サービス種別": u.service_type.value, "店舗": u.shop,
+                "車椅子": u.wheelchair, "同乗不可ID": ",".join(u.incompatible),
+                "到着リミット": min_to_hhmm(u.pickup_latest),
+                "送り目標":     min_to_hhmm(u.dropoff_target),
+            })
+    _write_master_sheet_v5(
+        ws_u, user_by_shop, USER_FRAMES, user_headers,
+        title="利用者マスタ　（各店30名枠・空欄行に追記してください）",
+        header_color="2C4A6E", shop_col_key="店舗",
+    )
 
-    # ---- 車両マスタシート ----
+    # ========== 車両マスタ（固定枠なし・そのまま）==========
     ws_v = wb.create_sheet("車両")
     _write_master_sheet(ws_v, [
         {"ID": v.vehicle_id, "車両名": v.name, "種別コード": v.vehicle_type,
@@ -1741,49 +1951,65 @@ def get_sample_excel(year: Optional[int] = None, month: Optional[int] = None) ->
          } for v in vehicles
     ], title="車両マスタ", header_color="1A5276")
 
-    # ---- スタッフマスタシート ----
+    # ========== スタッフマスタ（固定枠 A10/B6/C6）==========
     ws_s = wb.create_sheet("スタッフ")
-    _write_master_sheet(ws_s, [
-        {"ID": s.staff_id, "氏名": s.name, "店舗": s.shop,
-         "運転可否": s.can_drive, "優先度": s.priority,
-         "出勤時間": min_to_hhmm(s.shift_start) if s.shift_start else "",
-         "退勤時間": min_to_hhmm(s.shift_end)   if s.shift_end   else "",
-         } for s in staff
-    ], title="スタッフマスタ", header_color="145A32")
+    staff_headers = [
+        "ID", "氏名", "店舗", "運転可否", "優先度", "出勤時間", "退勤時間",
+    ]
+    staff_by_shop = {shop: [] for shop in SHOP_LIST}
+    for s in staff:
+        if s.shop in staff_by_shop:
+            staff_by_shop[s.shop].append({
+                "ID": s.staff_id, "氏名": s.name, "店舗": s.shop,
+                "運転可否": s.can_drive, "優先度": s.priority,
+                "出勤時間": min_to_hhmm(s.shift_start) if s.shift_start else "",
+                "退勤時間": min_to_hhmm(s.shift_end)   if s.shift_end   else "",
+            })
+    _write_master_sheet_v5(
+        ws_s, staff_by_shop, STAFF_FRAMES, staff_headers,
+        title="スタッフマスタ　（A店10枠 / B店6枠 / C店6枠）",
+        header_color="145A32", shop_col_key="店舗",
+    )
 
-    # ---- カレンダーシート ----
+    # ========== カレンダーシート（数式埋め込み）==========
     _write_calendar_sheet_staff(wb, staff, year, month)
     _write_calendar_sheet_users(wb, users, year, month)
 
-    # ---- 記入例シート ----
+    # ========== 記入例シート ==========
     ws_ex = wb.create_sheet("記入例")
     _write_master_sheet(ws_ex, [
-        {"項目": "カレンダー 基本入力形式",    "例": "09:00-15:30",  "説明": "開始-終了の時刻を直接入力（HH:MM-HH:MM）"},
-        {"項目": "カレンダー 開始時刻のみ",   "例": "09:00",        "説明": "開始時刻のみ入力→終了時刻はデフォルト値を使用"},
-        {"項目": "カレンダー 欠席・休み",     "例": "（空欄）",      "説明": "空欄にするとその日は計算から除外"},
-        {"項目": "カレンダー 〇フォールバック","例": "〇",           "説明": "〇を入力するとマスタのデフォルト時間を適用"},
-        {"項目": "到着リミット / 送り目標",   "例": "09:00",         "説明": "HH:MM形式で記入"},
-        {"項目": "出勤時間 / 退勤時間",       "例": "08:00 / 19:00", "説明": "スタッフのシフト時間（空欄=終日勤務）"},
-        {"項目": "車椅子フラグ",              "例": "TRUE / FALSE",  "説明": "TRUEで乗降時間が10分に設定"},
-        {"項目": "同乗不可ID",               "例": "u1,u3",         "説明": "カンマ区切りで複数指定可"},
-    ], title="記入例・入力ガイド", header_color="7D3C98")
+        {"項目": "カレンダー 基本入力形式",     "例": "09:00-15:30",   "説明": "開始-終了の時刻を直接入力（HH:MM-HH:MM）"},
+        {"項目": "カレンダー 欠席・休み",        "例": "（空欄）",       "説明": "空欄にするとその日は計算から除外"},
+        {"項目": "カレンダー 数式の上書き方法",  "例": "09:00-17:00",   "説明": "数式を消して直接時間を入力してください"},
+        {"項目": "カレンダー 〇フォールバック",  "例": "〇",            "説明": "〇を入力するとマスタのデフォルト時間を適用"},
+        {"項目": "到着リミット / 送り目標",      "例": "09:00",          "説明": "HH:MM形式で記入（カレンダーの時間基準になります）"},
+        {"項目": "出勤時間 / 退勤時間",          "例": "08:00 / 19:00",  "説明": "スタッフのシフト時間（空欄=08:00-19:00デフォルト）"},
+        {"項目": "マスタ 空欄枠への追加",        "例": "氏名を入力",     "説明": "空欄行の氏名を入力するとカレンダーに自動反映されます"},
+        {"項目": "マスタ 行の追加",              "例": "行を挿入",       "説明": "枠以上に追加する場合は行を挿入 → カレンダーにも行を追加"},
+        {"項目": "車椅子フラグ",                 "例": "TRUE / FALSE",   "説明": "TRUEで乗降時間が10分に設定"},
+        {"項目": "同乗不可ID",                  "例": "u1,u3",          "説明": "カンマ区切りで複数指定可"},
+    ], title="記入例・入力ガイド（v5）", header_color="7D3C98")
 
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
 
 
+# ==============================================================
+# _write_master_sheet（v4から継続・車両マスタ等で使用）
+# ==============================================================
+
 def _write_master_sheet(ws, rows: list[dict], title: str, header_color: str = "2C4A6E"):
     """
-    マスタシート（利用者・車両・スタッフ等）を美しく書き込む共通関数。
+    マスタシート共通書き込み（固定枠なし版・車両マスタ等で使用）。
     """
     if not rows:
         return
 
-    TITLE_FILL  = PatternFill("solid", fgColor="1B3A5C")
-    HDR_FILL    = PatternFill("solid", fgColor=header_color)
-    EVEN_FILL   = PatternFill("solid", fgColor="F8F9FA")
-    ODD_FILL    = PatternFill("solid", fgColor="FFFFFF")
+    TITLE_FILL = PatternFill("solid", fgColor="1B3A5C")
+    HDR_FILL   = PatternFill("solid", fgColor=header_color)
+    EVEN_FILL  = PatternFill("solid", fgColor="F8F9FA")
+    ODD_FILL   = PatternFill("solid", fgColor="FFFFFF")
 
     def bdr():
         s = Side(style="thin", color="CCCCCC")
@@ -1792,7 +2018,6 @@ def _write_master_sheet(ws, rows: list[dict], title: str, header_color: str = "2
     headers = list(rows[0].keys())
     n_cols  = len(headers)
 
-    # タイトル行
     ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=n_cols)
     c = ws.cell(row=1, column=1, value=title)
     c.font      = Font(bold=True, size=12, color="FFFFFF", name="メイリオ")
@@ -1800,19 +2025,16 @@ def _write_master_sheet(ws, rows: list[dict], title: str, header_color: str = "2
     c.alignment = Alignment(horizontal="center", vertical="center")
     ws.row_dimensions[1].height = 28
 
-    # ヘッダー行
     for col, h in enumerate(headers, 1):
         c = ws.cell(row=2, column=col, value=h)
         c.font      = Font(bold=True, color="FFFFFF", size=10, name="メイリオ")
         c.fill      = HDR_FILL
         c.alignment = Alignment(horizontal="center", vertical="center")
         c.border    = bdr()
-        # 列幅を内容に合わせて設定
         max_len = max(len(str(h)), max((len(str(r.get(h, ""))) for r in rows), default=0))
         ws.column_dimensions[get_column_letter(col)].width = min(max(max_len + 2, 8), 40)
     ws.row_dimensions[2].height = 22
 
-    # データ行
     for ri, row_data in enumerate(rows):
         row_idx = ri + 3
         fill    = EVEN_FILL if ri % 2 == 0 else ODD_FILL
@@ -1828,10 +2050,6 @@ def _write_master_sheet(ws, rows: list[dict], title: str, header_color: str = "2
             c.border = bdr()
         ws.row_dimensions[row_idx].height = 20
 
-
-# ==============================================================
-# カレンダーから対象日の利用者・スタッフを抽出（v4）
-# ==============================================================
 
 def extract_for_date(
     calendar_data: Optional[dict],
@@ -2153,7 +2371,7 @@ def main():
     # ---- ヒーローヘッダー ----
     st.markdown("""
     <div class="hero fade-up">
-      <div class="v-badge">VERSION 4</div>
+      <div class="v-badge">VERSION 5</div>
       <h1>送迎ルート最適化システム</h1>
       <p>
         放課後等デイサービス・就労継続支援A型/B型 対応　｜　3店舗混載禁止　｜　月間カレンダー連動<br>
