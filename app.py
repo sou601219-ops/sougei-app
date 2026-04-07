@@ -57,7 +57,7 @@ except ImportError:
 # ページ設定（必ず先頭）
 # ==============================================================
 st.set_page_config(
-    page_title="送迎ルート最適化 v5",
+    page_title="送迎ルート最適化 v6",
     page_icon="🚌",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -401,20 +401,24 @@ class TripType(Enum):
 
 @dataclass
 class User:
-    user_id:        str
-    name:           str
-    address:        str
-    lat:            float
-    lng:            float
-    service_type:   ServiceType
-    shop:           str
-    wheelchair:     bool  = False
-    incompatible:   list  = field(default_factory=list)
-    # 【第1改修】分単位で保持（HH:MM から変換済み）
-    pickup_latest:  int   = 540     # 迎え便 施設到着リミット（分）
-    dropoff_target: int   = 1050    # 送り便 自宅到着目標（分）
+    user_id:          str
+    name:             str
+    address:          str
+    lat:              float
+    lng:              float
+    service_type:     ServiceType
+    shop:             str
+    wheelchair:       bool  = False
+    incompatible:     list  = field(default_factory=list)
+    # ── 迎え便 時間枠（分単位）──
+    pickup_earliest:  int   = 0      # 迎え開始可能（SetMin at user node）。0=制約なし
+    pickup_latest:    int   = 540    # 迎えリミット（SetMax at user node）
+    facility_start:   int   = 540    # 利用開始時間 = カレンダーtw[0] / 施設到着目標
+    # ── 送り便 時間枠（分単位）──
+    facility_end:     int   = 1050   # 利用終了時間 = カレンダーtw[1] / 施設出発可能時刻
+    dropoff_latest:   int   = 0      # 送り到着リミット（SetMax at user node）。0=制約なし
     # 乗降時間（秒）: 通常 300秒(5分)、車椅子 600秒(10分)
-    service_time:   int   = 300
+    service_time:     int   = 300
 
     def __post_init__(self):
         if self.wheelchair:
@@ -616,20 +620,30 @@ class TransportVRPSolver:
             node_idx = manager.NodeToIndex(i + 1)  # ノード0はデポ、利用者は1始まり
 
             if self.trip_type == TripType.PICKUP:
-                # 迎え便: 施設到着リミット（pickup_latest）を SetMax で Hard Constraint 化
-                # pickup_latest は絶対時刻（分）なので、始点(start_time)からの相対秒に変換
-                limit_sec = (user.pickup_latest * 60) - self.start_time
-                if limit_sec > 0:
-                    # CumulVar はノード到着時の「出発からの経過時間（秒）」を表す
-                    time_dim.CumulVar(node_idx).SetMax(limit_sec)
+                # ── 迎え便: ユーザーの自宅ノードに時間枠を設定 ──
+                # pickup_earliest: 自宅/学校に到着できる最早時刻 → SetMin
+                if user.pickup_earliest > 0:
+                    earliest_sec = (user.pickup_earliest * 60) - self.start_time
+                    if earliest_sec > 0:
+                        time_dim.CumulVar(node_idx).SetMin(earliest_sec)
+                # pickup_latest: 自宅/学校に迎えに行く最遅時刻 → SetMax
+                if user.pickup_latest > 0:
+                    limit_sec = (user.pickup_latest * 60) - self.start_time
+                    if limit_sec > 0:
+                        time_dim.CumulVar(node_idx).SetMax(limit_sec)
 
             else:
-                # 送り便: 自宅到着目標（dropoff_target）を SetMax で適用（Soft→Hard）
-                # 送り便は遅延許容だが、目標+1時間をハードリミットとして設定
-                soft_limit_sec = (user.dropoff_target * 60) - self.start_time
-                hard_limit_sec = soft_limit_sec + 3600  # 1時間の余裕
-                if hard_limit_sec > 0:
-                    time_dim.CumulVar(node_idx).SetMax(hard_limit_sec)
+                # ── 送り便: ユーザーの自宅ノードに時間枠を設定 ──
+                # dropoff_latest: 自宅に届けなければならない最遅時刻 → SetMax
+                if user.dropoff_latest > 0:
+                    dl_sec = (user.dropoff_latest * 60) - self.start_time
+                    if dl_sec > 0:
+                        time_dim.CumulVar(node_idx).SetMax(dl_sec)
+                else:
+                    # dropoff_latest 未設定時は facility_end+2時間をソフトハードリミットに
+                    soft_sec = (user.facility_end * 60) - self.start_time + 7200
+                    if soft_sec > 0:
+                        time_dim.CumulVar(node_idx).SetMax(soft_sec)
 
         # デポ（ノード0）への帰着リミットは全体設定を使用
         depot_idx = manager.NodeToIndex(0)
@@ -981,20 +995,37 @@ def parse_time_range(cell_val, default_start: int = 480, default_end: int = 1140
 def get_demo_data() -> tuple[list[User], list[Vehicle], list[Staff]]:
     """デモ用マスタデータ"""
     users = [
-        User("u1",  "山田 太郎",   "富山市上袋100",   36.720, 137.210, ServiceType.HOUKAGO_DEI, "A店", False, [],      540,  1050),
-        User("u2",  "鈴木 花子",   "富山市堀川200",   36.695, 137.220, ServiceType.HOUKAGO_DEI, "A店", False, ["u3"], 570,  1080),
-        User("u3",  "田中 一郎",   "富山市婦中300",   36.660, 137.160, ServiceType.A_TYPE,      "A店", True,  ["u2"], 540,  1050),
-        User("u4",  "佐藤 愛",     "富山市大沢野400", 36.630, 137.230, ServiceType.B_TYPE,      "A店", False, [],      540,  1050),
-        User("u5",  "高橋 健太",   "富山市八尾500",   36.590, 137.270, ServiceType.HOUKAGO_DEI, "A店", False, [],      540,  1050),
-        User("u6",  "渡辺 さくら", "富山市上袋600",   36.725, 137.215, ServiceType.B_TYPE,      "B店", False, [],      540,  1050),
-        User("u7",  "伊藤 翔",     "富山市堀川700",   36.700, 137.225, ServiceType.A_TYPE,      "B店", False, [],      540,  1050),
-        User("u8",  "中村 みな",   "富山市婦中800",   36.655, 137.155, ServiceType.B_TYPE,      "B店", False, [],      600,  1110),
-        User("u9",  "小林 大輝",   "富山市大沢野900", 36.625, 137.235, ServiceType.HOUKAGO_DEI, "B店", False, [],      540,  1050),
-        User("u10", "加藤 りん",   "富山市八尾1000",  36.585, 137.265, ServiceType.A_TYPE,      "B店", False, [],      540,  1050),
-        User("u11", "中島 陽斗",   "富山市上袋1100",  36.715, 137.205, ServiceType.HOUKAGO_DEI, "C店", False, [],      540,  1050),
-        User("u12", "斉藤 みゆ",   "富山市堀川1200",  36.690, 137.215, ServiceType.B_TYPE,      "C店", True,  [],      570,  1080),
+        User("u1",  "山田 太郎",   "富山市上袋100",   36.720, 137.210, ServiceType.HOUKAGO_DEI, "A店"),
+        User("u2",  "鈴木 花子",   "富山市堀川200",   36.695, 137.220, ServiceType.HOUKAGO_DEI, "A店", incompatible=["u3"]),
+        User("u3",  "田中 一郎",   "富山市婦中300",   36.660, 137.160, ServiceType.A_TYPE,      "A店", wheelchair=True, incompatible=["u2"]),
+        User("u4",  "佐藤 愛",     "富山市大沢野400", 36.630, 137.230, ServiceType.B_TYPE,      "A店"),
+        User("u5",  "高橋 健太",   "富山市八尾500",   36.590, 137.270, ServiceType.HOUKAGO_DEI, "A店"),
+        User("u6",  "渡辺 さくら", "富山市上袋600",   36.725, 137.215, ServiceType.B_TYPE,      "B店"),
+        User("u7",  "伊藤 翔",     "富山市堀川700",   36.700, 137.225, ServiceType.A_TYPE,      "B店"),
+        User("u8",  "中村 みな",   "富山市婦中800",   36.655, 137.155, ServiceType.B_TYPE,      "B店"),
+        User("u9",  "小林 大輝",   "富山市大沢野900", 36.625, 137.235, ServiceType.HOUKAGO_DEI, "B店"),
+        User("u10", "加藤 りん",   "富山市八尾1000",  36.585, 137.265, ServiceType.A_TYPE,      "B店"),
+        User("u11", "中島 陽斗",   "富山市上袋1100",  36.715, 137.205, ServiceType.HOUKAGO_DEI, "C店"),
+        User("u12", "斉藤 みゆ",   "富山市堀川1200",  36.690, 137.215, ServiceType.B_TYPE,      "C店", wheelchair=True),
     ]
+    # デモ用のデフォルト時間を設定
+    demo_times = {
+        "u1":  (870, 540, 570, 1050, 0),   # 迎え開始可能14:30, リミット9:00, 施設9:30, 終了17:30
+        "u2":  (870, 570, 600, 1080, 0),
+        "u3":  (870, 540, 570, 1050, 0),
+        "u4":  (870, 540, 570, 1050, 0),
+        "u5":  (870, 540, 570, 1050, 0),
+        "u6":  (870, 540, 570, 1050, 0),
+        "u7":  (870, 540, 570, 1050, 0),
+        "u8":  (870, 600, 630, 1110, 0),
+        "u9":  (870, 540, 570, 1050, 0),
+        "u10": (870, 540, 570, 1050, 0),
+        "u11": (870, 540, 570, 1050, 0),
+        "u12": (870, 570, 600, 1080, 0),
+    }
     for u in users:
+        t = demo_times.get(u.user_id, (0, 540, 570, 1050, 0))
+        u.pickup_earliest, u.pickup_latest, u.facility_start, u.facility_end, u.dropoff_latest = t
         u.service_time = 600 if u.wheelchair else 300
 
     vehicles = [
@@ -1099,9 +1130,15 @@ STAFF_COL_SHIFT_ST  = "F"   # 出勤時間
 STAFF_COL_SHIFT_EN  = "G"   # 退勤時間
 
 # 利用者: A=ID B=氏名 C=住所 D=緯度 E=経度 F=サービス種別 G=店舗
-#          H=車椅子 I=同乗不可ID J=到着リミット K=送り目標
-USER_COL_NAME   = "B"
-USER_COL_LIMIT  = "J"   # 到着リミット
+#          H=車椅子 I=同乗不可ID
+#          J=迎え開始可能 K=迎えリミット L=利用開始時間 M=利用終了時間 N=送り到着リミット
+USER_COL_NAME        = "B"
+USER_COL_PICKUP_EARL = "J"   # 迎え開始可能
+USER_COL_PICKUP_LAST = "K"   # 迎えリミット
+USER_COL_FAC_START   = "L"   # 利用開始時間（カレンダー参照）
+USER_COL_FAC_END     = "M"   # 利用終了時間（カレンダー参照）
+USER_COL_DROP_LAST   = "N"   # 送り到着リミット
+USER_COL_LIMIT  = "L"   # カレンダー数式のデフォルト参照（利用開始時間）
 
 
 def _get_master_row_ranges(frames: dict[str, int]) -> dict[str, tuple[int, int]]:
@@ -1228,6 +1265,10 @@ def _write_master_sheet_v5(
                 shop_fill if slot_idx % 2 == 0 else ODD_FILL
             )
 
+            # 時間列はText形式に（Excelが時刻シリアル値に自動変換するのを防止）
+            TIME_COLS = {"出勤時間", "退勤時間", "迎え開始可能", "迎えリミット",
+                         "利用開始時間", "利用終了時間", "送り到着リミット",
+                         "到着リミット", "送り目標"}
             for col, h in enumerate(headers, 1):
                 val = row_data.get(h, "")
                 c   = ws.cell(row=row_idx, column=col, value=val)
@@ -1241,6 +1282,9 @@ def _write_master_sheet_v5(
                     vertical="center"
                 )
                 c.border = bdr()
+                # 時間列はTextフォーマット（@ = テキスト形式）
+                if h in TIME_COLS:
+                    c.number_format = "@"
             ws.row_dimensions[row_idx].height = 20
 
     # 列幅調整（全データを走査）
@@ -1404,13 +1448,14 @@ def _write_calendar_sheet_staff(wb, staff: list, year: int, month: int):
                 else:
                     # 平日: マスタのシフト時間を参照する数式
                     # F列(出勤時間)が空なら "08:00-19:00"、あれば F&"-"&G
+                    # TEXT()で時間シリアル値も文字列も両方に対応
                     time_formula = (
                         f'=IF(スタッフ!{STAFF_COL_NAME}{mst_row}="","",'
                         f'IF(スタッフ!{STAFF_COL_SHIFT_ST}{mst_row}="",'
                         f'"08:00-19:00",'
-                        f'スタッフ!{STAFF_COL_SHIFT_ST}{mst_row}'
+                        f'TEXT(スタッフ!{STAFF_COL_SHIFT_ST}{mst_row},"HH:MM")'
                         f'&"-"&'
-                        f'スタッフ!{STAFF_COL_SHIFT_EN}{mst_row}))'
+                        f'TEXT(スタッフ!{STAFF_COL_SHIFT_EN}{mst_row},"HH:MM")))'
                     )
                     c = ws.cell(row=cal_row, column=col, value=time_formula)
                     c.fill   = C_FORMULA
@@ -1588,12 +1633,15 @@ def _write_calendar_sheet_users(wb, users: list, year: int, month: int):
                     c.border = bdr()
                     c.alignment = Alignment(horizontal="center", vertical="center")
                 else:
-                    # 平日: "08:00-{到着リミット}" の数式
-                    # マスタJ列（到着リミット）を参照
-                    # 例: 到着リミットが"09:00"なら → "08:00-09:00"
+                    # 平日: 「利用開始時間-利用終了時間」の数式
+                    # マスタL列（利用開始時間）＆M列（利用終了時間）を参照
+                    # カレンダーに入力する時間 = 施設での滞在時間
+                    # TEXT()でシリアル値・文字列どちらも正しく表示
                     time_formula = (
                         f'=IF(利用者!{USER_COL_NAME}{mst_row}="","",'
-                        f'"08:00-"&利用者!{USER_COL_LIMIT}{mst_row})'
+                        f'TEXT(利用者!{USER_COL_FAC_START}{mst_row},"HH:MM")'
+                        f'&"-"&'
+                        f'TEXT(利用者!{USER_COL_FAC_END}{mst_row},"HH:MM"))'
                     )
                     c = ws.cell(row=cal_row, column=col, value=time_formula)
                     c.fill   = C_FORMULA
@@ -1669,9 +1717,18 @@ def parse_excel_upload(
             [x.strip() for x in incomp_raw.split(",") if x.strip()]
             if incomp_raw not in ("", "nan") else []
         )
-        wc     = bool(row.get("車椅子", False))
-        pu_lim = hhmm_to_min(row.get("到着リミット", ""), default_pickup_limit)
-        do_tgt = hhmm_to_min(row.get("送り目標",   ""), default_dropoff_target)
+        wc = bool(row.get("車椅子", False))
+        # 【v6】新しい時間項目（空欄の場合はデフォルト値）
+        pickup_earl = hhmm_to_min(row.get("迎え開始可能",  ""), 0)
+        pickup_last = hhmm_to_min(row.get("迎えリミット",  ""), default_pickup_limit)
+        fac_start   = hhmm_to_min(row.get("利用開始時間",  ""), default_pickup_limit)
+        fac_end     = hhmm_to_min(row.get("利用終了時間",  ""), default_dropoff_target)
+        drop_last   = hhmm_to_min(row.get("送り到着リミット",""), 0)
+        # 後方互換: 旧カラム名にも対応
+        if pickup_last == default_pickup_limit and row.get("到着リミット", ""):
+            pickup_last = hhmm_to_min(row.get("到着リミット", ""), default_pickup_limit)
+        if fac_end == default_dropoff_target and row.get("送り目標", ""):
+            fac_end = hhmm_to_min(row.get("送り目標", ""), default_dropoff_target)
 
         # 緯度・経度: 空や数式の場合はデフォルト値
         try:
@@ -1684,18 +1741,21 @@ def parse_excel_upload(
             lng = 137.211
 
         users.append(User(
-            user_id        = str(row.get("ID", f"u{i+1}")),
-            name           = str(name_val).strip(),
-            address        = str(row.get("住所", "")),
-            lat            = lat,
-            lng            = lng,
-            service_type   = svc_map.get(str(row.get("サービス種別", "")), ServiceType.HOUKAGO_DEI),
-            shop           = str(row.get("店舗", "A店")),
-            wheelchair     = wc,
-            incompatible   = incomp,
-            pickup_latest  = pu_lim,
-            dropoff_target = do_tgt,
-            service_time   = 600 if wc else 300,
+            user_id          = str(row.get("ID", f"u{i+1}")),
+            name             = str(name_val).strip(),
+            address          = str(row.get("住所", "")),
+            lat              = lat,
+            lng              = lng,
+            service_type     = svc_map.get(str(row.get("サービス種別", "")), ServiceType.HOUKAGO_DEI),
+            shop             = str(row.get("店舗", "A店")),
+            wheelchair       = wc,
+            incompatible     = incomp,
+            pickup_earliest  = pickup_earl,
+            pickup_latest    = pickup_last,
+            facility_start   = fac_start,
+            facility_end     = fac_end,
+            dropoff_latest   = drop_last,
+            service_time     = 600 if wc else 300,
         ))
 
     # ---- 車両シート ----
@@ -1922,7 +1982,7 @@ def get_sample_excel(year: Optional[int] = None, month: Optional[int] = None) ->
     user_headers = [
         "ID", "氏名", "住所", "緯度", "経度",
         "サービス種別", "店舗", "車椅子", "同乗不可ID",
-        "到着リミット", "送り目標",
+        "迎え開始可能", "迎えリミット", "利用開始時間", "利用終了時間", "送り到着リミット",
     ]
     # 店舗ごとにデモデータを整理
     user_by_shop = {shop: [] for shop in SHOP_LIST}
@@ -1933,8 +1993,11 @@ def get_sample_excel(year: Optional[int] = None, month: Optional[int] = None) ->
                 "緯度": u.lat, "経度": u.lng,
                 "サービス種別": u.service_type.value, "店舗": u.shop,
                 "車椅子": u.wheelchair, "同乗不可ID": ",".join(u.incompatible),
-                "到着リミット": min_to_hhmm(u.pickup_latest),
-                "送り目標":     min_to_hhmm(u.dropoff_target),
+                "迎え開始可能":    min_to_hhmm(u.pickup_earliest) if u.pickup_earliest else "",
+                "迎えリミット":    min_to_hhmm(u.pickup_latest),
+                "利用開始時間":    min_to_hhmm(u.facility_start),
+                "利用終了時間":    min_to_hhmm(u.facility_end),
+                "送り到着リミット": min_to_hhmm(u.dropoff_latest) if u.dropoff_latest else "",
             })
     _write_master_sheet_v5(
         ws_u, user_by_shop, USER_FRAMES, user_headers,
@@ -1982,7 +2045,11 @@ def get_sample_excel(year: Optional[int] = None, month: Optional[int] = None) ->
         {"項目": "カレンダー 欠席・休み",        "例": "（空欄）",       "説明": "空欄にするとその日は計算から除外"},
         {"項目": "カレンダー 数式の上書き方法",  "例": "09:00-17:00",   "説明": "数式を消して直接時間を入力してください"},
         {"項目": "カレンダー 〇フォールバック",  "例": "〇",            "説明": "〇を入力するとマスタのデフォルト時間を適用"},
-        {"項目": "到着リミット / 送り目標",      "例": "09:00",          "説明": "HH:MM形式で記入（カレンダーの時間基準になります）"},
+        {"項目": "迎え開始可能",                 "例": "14:30",          "説明": "自宅/学校に迎えに行ける最早時刻（HH:MM）。空欄=制約なし"},
+        {"項目": "迎えリミット",                 "例": "15:00",          "説明": "自宅/学校への最遅到着時刻（HH:MM）。VRP SetMax"},
+        {"項目": "利用開始時間",                 "例": "15:30",          "説明": "施設到着の目標時刻（HH:MM）= カレンダー左側"},
+        {"項目": "利用終了時間",                 "例": "17:30",          "説明": "施設を出発できる時刻（HH:MM）= カレンダー右側"},
+        {"項目": "送り到着リミット",             "例": "18:30",          "説明": "自宅に届ける最遅時刻（HH:MM）。空欄=制約なし"},
         {"項目": "出勤時間 / 退勤時間",          "例": "08:00 / 19:00",  "説明": "スタッフのシフト時間（空欄=08:00-19:00デフォルト）"},
         {"項目": "マスタ 空欄枠への追加",        "例": "氏名を入力",     "説明": "空欄行の氏名を入力するとカレンダーに自動反映されます"},
         {"項目": "マスタ 行の追加",              "例": "行を挿入",       "説明": "枠以上に追加する場合は行を挿入 → カレンダーにも行を追加"},
@@ -2112,11 +2179,11 @@ def extract_for_date(
             continue
 
         import copy
-        u_copy               = copy.copy(u)
-        # カレンダーの開始時刻 → デポ出発時刻の上限として pickup_latest に使用
-        # 終了時刻 → 施設到着リミット（迎え便）/ 送り目標（送り便）
-        u_copy.pickup_latest  = tw[1]   # カレンダー終了時刻 = 迎え到着リミット
-        u_copy.dropoff_target = tw[1] + 150  # 送り目標は+2.5h
+        u_copy = copy.copy(u)
+        # tw[0]=利用開始時間(迎えリミットとして適用), tw[1]=利用終了時間(送り便基準)
+        u_copy.facility_start = tw[0]   # カレンダー左=利用開始時間
+        u_copy.pickup_latest  = tw[0]   # 迎えリミットにも反映
+        u_copy.facility_end   = tw[1]   # カレンダー右=利用終了時間
         filtered_users.append(u_copy)
 
     return filtered_users, filtered_staff
@@ -2366,16 +2433,218 @@ def render_map(routes: list[AssignedRoute]):
 # Streamlit UI メイン
 # ==============================================================
 
+
+def _build_user_editor_df(
+    all_users:     list,
+    calendar_data: Optional[dict],
+    target_date:   "datetime.date",
+) -> "pd.DataFrame":
+    """
+    利用者エディタ用 DataFrame を構築する。
+
+    【v6仕様】
+    - all_users を全員表示する
+    - カレンダーに時間がある日 → 出席=True、時間はカレンダー値で上書き
+    - カレンダーが空欄の日    → 出席=False、時間はマスタ値をそのまま表示
+    - カレンダーなし          → 出席=True（全員参加のデフォルト）
+    """
+    date_str = target_date.strftime("%Y-%m-%d")
+    users_cal = calendar_data.get("users", {}) if calendar_data else {}
+
+    rows = []
+    for u in sorted(all_users, key=lambda x: (x.shop, x.name)):
+        schedule = users_cal.get(u.name)
+
+        if schedule is None:
+            # カレンダー未登録 → デフォルトON
+            checked      = True
+            pickup_disp  = min_to_hhmm(u.pickup_latest)
+            dropoff_disp = min_to_hhmm(u.dropoff_target)
+        else:
+            tw = schedule.get(date_str, "MISSING")
+            if tw == "MISSING":
+                # その日付がカレンダーにない → デフォルトON
+                checked      = True
+                pickup_disp  = min_to_hhmm(u.pickup_latest)
+                dropoff_disp = min_to_hhmm(u.dropoff_target)
+            elif tw is None:
+                # 明示的に空欄 → OFF
+                checked      = False
+                pickup_disp  = min_to_hhmm(u.pickup_latest)
+                dropoff_disp = min_to_hhmm(u.dropoff_target)
+            else:
+                # 時間あり → ON、カレンダー時間を表示
+                checked      = True
+                pickup_disp  = min_to_hhmm(tw[0])   # カレンダー左=利用開始=迎えリミット
+                dropoff_disp = min_to_hhmm(u.dropoff_target)
+
+        rows.append({
+            "出席":         checked,
+            "店舗":         u.shop,
+            "氏名":         u.name,
+            "サービス":     u.service_type.value,
+            "車椅子":       "♿" if u.wheelchair else "",
+            "迎え開始可能":  min_to_hhmm(u.pickup_earliest) if u.pickup_earliest else "",
+            "迎えリミット":  pickup_disp,
+            "利用開始時間":  min_to_hhmm(u.facility_start),
+            "利用終了時間":  dropoff_disp,
+            "送り到着リミット": min_to_hhmm(u.dropoff_latest) if u.dropoff_latest else "",
+            "_uid":         u.user_id,
+        })
+    return pd.DataFrame(rows)
+
+
+def _build_staff_editor_df(
+    all_staff:     list,
+    calendar_data: Optional[dict],
+    target_date:   "datetime.date",
+) -> "pd.DataFrame":
+    """
+    スタッフエディタ用 DataFrame を構築する。
+
+    【v6仕様】
+    - all_staff を全員表示する
+    - カレンダーに時間がある日 → 出勤=True、時間はカレンダー値で上書き
+    - カレンダーが空欄の日    → 出勤=False
+    - カレンダーなし          → 出勤=True（全員参加のデフォルト）
+    """
+    date_str  = target_date.strftime("%Y-%m-%d")
+    staff_cal = calendar_data.get("staff", {}) if calendar_data else {}
+
+    rows = []
+    for s in sorted(all_staff, key=lambda x: (x.shop, x.priority)):
+        schedule = staff_cal.get(s.name)
+
+        if schedule is None:
+            checked    = True
+            shift_disp_start = min_to_hhmm(s.shift_start) if s.shift_start else "08:00"
+            shift_disp_end   = min_to_hhmm(s.shift_end)   if s.shift_end   else "19:00"
+        else:
+            tw = schedule.get(date_str, "MISSING")
+            if tw == "MISSING":
+                checked          = True
+                shift_disp_start = min_to_hhmm(s.shift_start) if s.shift_start else "08:00"
+                shift_disp_end   = min_to_hhmm(s.shift_end)   if s.shift_end   else "19:00"
+            elif tw is None:
+                checked          = False
+                shift_disp_start = min_to_hhmm(s.shift_start) if s.shift_start else "08:00"
+                shift_disp_end   = min_to_hhmm(s.shift_end)   if s.shift_end   else "19:00"
+            else:
+                checked          = True
+                shift_disp_start = min_to_hhmm(tw[0])
+                shift_disp_end   = min_to_hhmm(tw[1])
+
+        rows.append({
+            "出勤":     checked,
+            "店舗":     s.shop,
+            "氏名":     s.name,
+            "優先度":   s.priority,
+            "運転可否": s.can_drive,
+            "出勤時間": shift_disp_start,
+            "退勤時間": shift_disp_end,
+            "_sid":     s.staff_id,
+        })
+    return pd.DataFrame(rows)
+
+
+def _reconstruct_users_from_editor(
+    edited_df:    "pd.DataFrame",
+    all_users:    list,
+) -> list:
+    """
+    data_editor で編集された DataFrame から User リストを再構築する。
+
+    出席=True の行のみを対象とし、
+    エディタで変更された「迎えリミット」「送り目標」を
+    User.pickup_latest / User.dropoff_target に反映する。
+    """
+    import copy
+
+    # user_id → User のマップ
+    user_map = {u.user_id: u for u in all_users}
+    result   = []
+
+    for _, row in edited_df.iterrows():
+        if not row.get("出席", False):
+            continue
+
+        uid  = row.get("_uid", "")
+        orig = user_map.get(str(uid))
+        if orig is None:
+            continue
+
+        u_new = copy.copy(orig)
+
+        # 編集された時間を反映（HH:MM → 分数）
+        def _read_time(key, default):
+            v = str(row.get(key, "")).strip()
+            return hhmm_to_min(v, default) if v not in ("", "nan") else default
+
+        u_new.pickup_earliest = _read_time("迎え開始可能",    orig.pickup_earliest)
+        u_new.pickup_latest   = _read_time("迎えリミット",    orig.pickup_latest)
+        u_new.facility_start  = _read_time("利用開始時間",    orig.facility_start)
+        u_new.facility_end    = _read_time("利用終了時間",    orig.facility_end)
+        u_new.dropoff_latest  = _read_time("送り到着リミット", orig.dropoff_latest)
+
+        result.append(u_new)
+
+    return result
+
+
+def _reconstruct_staff_from_editor(
+    edited_df:  "pd.DataFrame",
+    all_staff:  list,
+) -> list:
+    """
+    data_editor で編集された DataFrame から Staff リストを再構築する。
+
+    出勤=True の行のみを対象とし、
+    エディタで変更された「運転可否」「出勤時間」「退勤時間」を
+    Staff に反映する。
+    """
+    import copy
+
+    staff_map = {s.staff_id: s for s in all_staff}
+    result    = []
+
+    for _, row in edited_df.iterrows():
+        if not row.get("出勤", False):
+            continue
+
+        sid  = row.get("_sid", "")
+        orig = staff_map.get(str(sid))
+        if orig is None:
+            continue
+
+        s_new = copy.copy(orig)
+
+        # 運転可否（編集可能チェックボックス）
+        can_drive_val  = row.get("運転可否", orig.can_drive)
+        s_new.can_drive = bool(can_drive_val)
+
+        # シフト時間（編集可能テキスト）
+        ss_raw = str(row.get("出勤時間", ""))
+        se_raw = str(row.get("退勤時間", ""))
+        ss = hhmm_to_min(ss_raw, -1) if ss_raw.strip() not in ("", "nan") else None
+        se = hhmm_to_min(se_raw, -1) if se_raw.strip() not in ("", "nan") else None
+        s_new.shift_start = ss if ss != -1 else orig.shift_start
+        s_new.shift_end   = se if se != -1 else orig.shift_end
+
+        result.append(s_new)
+
+    return result
+
+
 def main():
 
-    # ---- ヒーローヘッダー ----
+    # ---- ヘッダー ----
     st.markdown("""
     <div class="hero fade-up">
-      <div class="v-badge">VERSION 5</div>
+      <div class="v-badge">VERSION 6</div>
       <h1>送迎ルート最適化システム</h1>
       <p>
         放課後等デイサービス・就労継続支援A型/B型 対応　｜　3店舗混載禁止　｜　月間カレンダー連動<br>
-        個別Time Windows・スタッフシフト制約・迎え／送り同時計算
+        カレンダー自動チェック・UI上での直接微調整・迎え／送り同時計算
       </p>
     </div>
     """, unsafe_allow_html=True)
@@ -2384,22 +2653,17 @@ def main():
     # サイドバー
     # ================================================================
     with st.sidebar:
-
-        # アルゴリズム表示
         algo_color = "#27AE60" if ORTOOLS_AVAILABLE else "#E67E22"
         algo_label = "OR-Tools（高精度VRP）" if ORTOOLS_AVAILABLE else "グリーディ（高速）"
         st.markdown(f"""
         <div class="sidebar-section">
           <h4>⚙️ システム状態</h4>
           <div style="font-size:12px;color:{algo_color};font-weight:700;">● {algo_label}</div>
-          <div style="font-size:11px;color:#888;margin-top:4px;">
-            {"OR-Tools インストール済み" if ORTOOLS_AVAILABLE else "pip install ortools で高精度モードに変更可能"}
-          </div>
         </div>
         """, unsafe_allow_html=True)
 
-        # 対象日選択
-        st.markdown('<div class="sidebar-section"><h4>📅 対象日</h4>', unsafe_allow_html=True)
+        # 📅 対象日（サイドバー最上部に配置）
+        st.markdown('<div class="sidebar-section"><h4>📅 送迎実施日</h4>', unsafe_allow_html=True)
         target_date = st.date_input(
             "送迎実施日",
             value=datetime.date.today(),
@@ -2410,10 +2674,9 @@ def main():
         """, unsafe_allow_html=True)
         st.markdown("</div>", unsafe_allow_html=True)
 
-        # 時刻設定
-        st.markdown('<div class="sidebar-section"><h4>⏰ デフォルト時刻設定</h4>', unsafe_allow_html=True)
-        st.caption("Excelが空欄の場合のデフォルト値")
-
+        # ⏰ 時刻デフォルト設定
+        st.markdown('<div class="sidebar-section"><h4>⏰ デフォルト時刻</h4>', unsafe_allow_html=True)
+        st.caption("Excelが空欄の場合のフォールバック値")
         st.markdown("**迎え便**")
         c1, c2 = st.columns(2)
         with c1:
@@ -2422,7 +2685,6 @@ def main():
         with c2:
             pu_lh = st.number_input("リミット 時", 6,  13, 9,  key="pu_lh")
             pu_lm = st.number_input("リミット 分", 0,  55, 0,  step=5, key="pu_lm")
-
         st.markdown("**送り便**")
         c3, c4 = st.columns(2)
         with c3:
@@ -2431,91 +2693,91 @@ def main():
         with c4:
             do_lh = st.number_input("目標 時", 16, 22, 19, key="do_lh")
             do_lm = st.number_input("目標 分", 0,  55, 0,  step=5, key="do_lm")
-
         pu_start = pu_sh * 60 + pu_sm
         pu_limit = pu_lh * 60 + pu_lm
         do_start = do_sh * 60 + do_sm
         do_limit = do_lh * 60 + do_lm
         st.markdown("</div>", unsafe_allow_html=True)
 
-        # サンプルExcelダウンロード
+        # 📥 テンプレートDL
         st.markdown('<div class="sidebar-section"><h4>📥 テンプレート</h4>', unsafe_allow_html=True)
         if OPENPYXL_AVAILABLE:
             st.download_button(
-                "サンプルExcel（v3対応）",
-                data=get_sample_excel(),
-                file_name="送迎マスタ_サンプルv3.xlsx",
+                "サンプルExcel（v5対応）をダウンロード",
+                data=get_sample_excel(target_date.year, target_date.month),
+                file_name=f"送迎マスタ_サンプル_{target_date.year}{target_date.month:02d}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True,
             )
-            st.caption("シート: 利用者 / 車両 / スタッフ / 月間カレンダー / 記入例")
+            st.caption("シート: 利用者 / 車両 / スタッフ / カレンダー_スタッフ / カレンダー_利用者")
         st.markdown("</div>", unsafe_allow_html=True)
 
     # ================================================================
     # STEP 1: データ読み込み
     # ================================================================
-    step_header(1, "データの読み込み", "Excelアップロード または デモデータで即時起動")
+    step_header(1, "Excelを読み込む",
+                "1ヶ月分の利用予定・シフトが入ったExcelをアップロードしてください")
 
     col_up, col_demo = st.columns([3, 1])
-
     with col_up:
         uploaded = st.file_uploader(
-            "Excelファイルをアップロード（.xlsx / .xls）",
+            "Excelファイルをアップロード（.xlsx）",
             type=["xlsx", "xls"],
-            help="サイドバーから v3 対応サンプルExcelをDLしてご利用ください",
+            help="サイドバーからサンプルExcelをダウンロードして記入してください",
         )
         if uploaded:
             try:
                 with st.spinner("読み込み中..."):
-                    users, vehicles, staff, cal_df = parse_excel_upload(
+                    users, vehicles, staff, cal_data = parse_excel_upload(
                         uploaded, pu_limit, do_limit
                     )
                 st.session_state.update({
                     "users": users, "vehicles": vehicles,
-                    "staff": staff, "calendar": cal_df,
+                    "staff": staff, "calendar": cal_data,
                 })
+                cal_msg = ""
+                if cal_data:
+                    sc = cal_data.get("staff", {}); uc = cal_data.get("users", {})
+                    yr = cal_data.get("year", ""); mo = cal_data.get("month", "")
+                    cal_msg = f"　月間カレンダー **{yr}年{mo}月** (スタッフ{len(sc)}名/利用者{len(uc)}名)"
                 st.success(
-                    f"✅ 読み込み完了　"
-                    f"利用者 **{len(users)}名** / 車両 **{len(vehicles)}台** / "
-                    f"スタッフ **{len(staff)}名**"
-                    + (f" / 月間カレンダー **あり**" if cal_df is not None else "")
+                    f"✅ 読み込み完了　利用者 **{len(users)}名** / "
+                    f"車両 **{len(vehicles)}台** / スタッフ **{len(staff)}名**{cal_msg}"
                 )
             except Exception as e:
                 st.error(f"❌ 読み込み失敗: {e}")
-                st.info("シート名・カラム名をサンプルExcelと一致させてください")
+                st.info("シート名・列名がサンプルExcelと一致しているか確認してください")
 
     with col_demo:
         st.markdown("<br><br>", unsafe_allow_html=True)
         if st.button("🎯 デモデータで試す", use_container_width=True, type="secondary"):
             users, vehicles, staff = get_demo_data()
-            cal_df = build_demo_calendar(users, staff, target_date.year, target_date.month)
+            cal_data = build_demo_calendar(users, staff, target_date.year, target_date.month)
             st.session_state.update({
                 "users": users, "vehicles": vehicles,
-                "staff": staff, "calendar": cal_df,
+                "staff": staff, "calendar": cal_data,
             })
             st.success("✅ デモデータ読み込み完了")
 
     if "users" not in st.session_state:
-        st.info("👆 Excelをアップロードするか、デモデータで試してください")
+        st.info("👆 Excelをアップロードするか「デモデータで試す」をクリックしてください")
         return
 
     all_users    = st.session_state["users"]
     all_vehicles = st.session_state["vehicles"]
     all_staff    = st.session_state["staff"]
-    calendar_df  = st.session_state.get("calendar")
+    calendar_data = st.session_state.get("calendar")
 
-    # プレビュー（折りたたみ）
-    with st.expander("📋 マスタデータのプレビュー", expanded=False):
+    # マスタプレビュー（折りたたみ）
+    with st.expander("📋 マスタデータを確認する", expanded=False):
         t1, t2, t3, t4 = st.tabs(["👶 利用者", "🚗 車両", "👤 スタッフ", "📅 カレンダー"])
         with t1:
             st.dataframe(pd.DataFrame([{
-                "ID": u.user_id, "氏名": u.name, "店舗": u.shop,
-                "サービス": u.service_type.value, "住所": u.address,
-                "車椅子": "♿" if u.wheelchair else "",
-                "乗降(分)": u.service_time // 60,
+                "氏名": u.name, "店舗": u.shop, "サービス": u.service_type.value,
+                "住所": u.address, "車椅子": "♿" if u.wheelchair else "",
                 "迎えリミット": min_to_hhmm(u.pickup_latest),
                 "送り目標":    min_to_hhmm(u.dropoff_target),
-                "同乗不可": ",".join(u.incompatible) or "なし",
+                "同乗不可":    ",".join(u.incompatible) or "なし",
             } for u in all_users]), use_container_width=True, hide_index=True)
         with t2:
             st.dataframe(pd.DataFrame([{
@@ -2526,183 +2788,193 @@ def main():
         with t3:
             st.dataframe(pd.DataFrame([{
                 "氏名": s.name, "店舗": s.shop,
-                "運転": "✅" if s.can_drive else "❌",
-                "優先度": s.priority,
+                "運転": "✅" if s.can_drive else "❌", "優先度": s.priority,
                 "出勤": min_to_hhmm(s.shift_start) if s.shift_start else "終日",
                 "退勤": min_to_hhmm(s.shift_end)   if s.shift_end   else "終日",
             } for s in all_staff]), use_container_width=True, hide_index=True)
         with t4:
-            if calendar_df is not None:
-                # calendar_df は v4以降 dict 型（{"staff":..., "users":..., "year":..., "month":...}）
-                year_c  = calendar_df.get("year",  "?")
-                month_c = calendar_df.get("month", "?")
-                sc      = calendar_df.get("staff", {})
-                uc      = calendar_df.get("users", {})
-                st.caption(
-                    f"📅 {year_c}年{month_c}月　"
-                    f"スタッフ: **{len(sc)}名**分　利用者: **{len(uc)}名**分"
-                )
+            if calendar_data:
+                sc = calendar_data.get("staff", {}); uc = calendar_data.get("users", {})
+                yr = calendar_data.get("year", "?"); mo = calendar_data.get("month", "?")
+                st.caption(f"📅 {yr}年{mo}月　スタッフ **{len(sc)}名**分　利用者 **{len(uc)}名**分")
                 col_s, col_u = st.columns(2)
                 with col_s:
-                    st.markdown("**スタッフ カレンダー**")
+                    st.markdown("**スタッフ**")
                     if sc:
-                        sample_name = next(iter(sc))
-                        sample_days = list(sc[sample_name].items())[:7]
-                        rows = [
-                            {"日付": d,
-                             "時間": f"{min_to_hhmm(v[0])}〜{min_to_hhmm(v[1])}" if v else "休み"}
-                            for d, v in sample_days
-                        ]
-                        st.caption(f"（{sample_name} の最初の7日間）")
-                        st.dataframe(
-                            pd.DataFrame(rows),
-                            use_container_width=True, hide_index=True
-                        )
-                    else:
-                        st.info("スタッフカレンダーデータなし")
+                        nm = next(iter(sc))
+                        rows = [{"日付": d, "時間": f"{min_to_hhmm(v[0])}〜{min_to_hhmm(v[1])}" if v else "休み"}
+                                for d, v in list(sc[nm].items())[:7]]
+                        st.caption(f"{nm} の最初の7日間")
+                        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
                 with col_u:
-                    st.markdown("**利用者 カレンダー**")
+                    st.markdown("**利用者**")
                     if uc:
-                        sample_name = next(iter(uc))
-                        sample_days = list(uc[sample_name].items())[:7]
-                        rows = [
-                            {"日付": d,
-                             "時間": f"{min_to_hhmm(v[0])}〜{min_to_hhmm(v[1])}" if v else "欠席"}
-                            for d, v in sample_days
-                        ]
-                        st.caption(f"（{sample_name} の最初の7日間）")
-                        st.dataframe(
-                            pd.DataFrame(rows),
-                            use_container_width=True, hide_index=True
-                        )
-                    else:
-                        st.info("利用者カレンダーデータなし")
+                        nm = next(iter(uc))
+                        rows = [{"日付": d, "時間": f"{min_to_hhmm(v[0])}〜{min_to_hhmm(v[1])}" if v else "欠席"}
+                                for d, v in list(uc[nm].items())[:7]]
+                        st.caption(f"{nm} の最初の7日間")
+                        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
             else:
                 st.info("月間カレンダーシートが読み込まれていません")
 
     st.divider()
 
     # ================================================================
-    # STEP 2: 対象日フィルタリング + 欠席トグル
+    # STEP 2: 日付選択・カレンダー自動チェック・微調整
     # ================================================================
     step_header(
         2,
-        f"対象日のデータ確認  {target_date.strftime('%m/%d')}",
-        "月間カレンダーから自動抽出 → 手動微調整"
+        f"出欠・シフトを確認して微調整する　{target_date.strftime('(%m/%d)')}",
+        "カレンダーから自動でチェック済み → そのまま実行 or 変更して微調整",
     )
 
-    # 月間カレンダーから対象日のデータを抽出
-    if calendar_df is not None:
-        filtered_users, filtered_staff = extract_for_date(
-            calendar_df, all_users, all_staff, target_date
+    if calendar_data:
+        sc = calendar_data.get("staff", {}); uc = calendar_data.get("users", {})
+        # 当日の出席人数をプレビュー表示
+        date_str = target_date.strftime("%Y-%m-%d")
+        auto_u = sum(
+            1 for u in all_users
+            if uc.get(u.name, {}).get(date_str, "MISSING") not in (None,)
+            and uc.get(u.name, {}).get(date_str, "MISSING") != "MISSING"
+            or u.name not in uc
         )
-        n_extracted_u = len(filtered_users)
-        n_extracted_s = len(filtered_staff)
-
-        st.markdown(
-            f"📅 **{target_date.strftime('%Y年%m月%d日')}** の自動抽出結果　"
-            f"利用者 **{n_extracted_u}名** / スタッフ **{n_extracted_s}名**",
+        auto_s = sum(
+            1 for s in all_staff
+            if sc.get(s.name, {}).get(date_str, "MISSING") not in (None,)
+            and sc.get(s.name, {}).get(date_str, "MISSING") != "MISSING"
+            or s.name not in sc
+        )
+        st.info(
+            f"📅 **{target_date.strftime('%Y年%m月%d日')}** のカレンダーを参照しました。"
+            f"　利用者 **{auto_u}名** / スタッフ **{auto_s}名** が自動でチェックONになっています。"
+            f"　変更がある場合は下のチェックや時間を直接編集してください。"
         )
     else:
-        filtered_users = all_users
-        filtered_staff = all_staff
-        st.info("月間カレンダーが未読み込みのため全員を表示しています。")
+        st.info("月間カレンダーが未読み込みのため、全員チェックONで表示しています。")
 
-    # 当日欠席トグル（v2継続）
-    st.markdown("#### 📝 当日の出欠・シフト最終確認")
+    # ──────────────────────────────────────────────────────────
+    # 利用者テーブル（カレンダー連動チェック + 時間編集可能）
+    # ──────────────────────────────────────────────────────────
+    st.markdown("#### 👶 利用者")
     st.caption(
-        "チェック = 本日参加／出勤。急な欠席・変更はここで外してください。"
+        "✅ チェック = 本日送迎対象。時間項目（迎え開始可能・迎えリミット・利用時間・送りリミット）は直接書き換えて当日の微調整ができます。"
     )
 
-    attend_df = pd.DataFrame([{
-        "出席":      True,
-        "店舗":      u.shop,
-        "氏名":      u.name,
-        "サービス":  u.service_type.value,
-        "住所":      u.address,
-        "車椅子":    "♿" if u.wheelchair else "",
-        "迎えリミット": min_to_hhmm(u.pickup_latest),
-        "送り目標":  min_to_hhmm(u.dropoff_target),
-        "_uid":      u.user_id,
-    } for u in sorted(filtered_users, key=lambda x: (x.shop, x.name))])
+    user_df = _build_user_editor_df(all_users, calendar_data, target_date)
 
-    edited_attend = st.data_editor(
-        attend_df,
+    edited_user_df = st.data_editor(
+        user_df,
         use_container_width=True,
         hide_index=True,
         column_config={
-            "出席":         st.column_config.CheckboxColumn("出席", width="small"),
-            "店舗":         st.column_config.TextColumn("店舗",    width="small"),
-            "氏名":         st.column_config.TextColumn("氏名",    width="medium"),
-            "サービス":     st.column_config.TextColumn("サービス",width="medium"),
-            "住所":         st.column_config.TextColumn("住所",    width="large"),
-            "車椅子":       st.column_config.TextColumn("車椅子",  width="small"),
-            "迎えリミット": st.column_config.TextColumn("迎えリミット", width="small"),
-            "送り目標":     st.column_config.TextColumn("送り目標",    width="small"),
-            "_uid":         st.column_config.TextColumn("_uid",    disabled=True),
+            "出席":           st.column_config.CheckboxColumn("出席",      width="small"),
+            "店舗":           st.column_config.TextColumn("店舗",           width="small"),
+            "氏名":           st.column_config.TextColumn("氏名",           width="medium"),
+            "サービス":       st.column_config.TextColumn("サービス",       width="small"),
+            "車椅子":         st.column_config.TextColumn("♿",             width="small"),
+            "迎え開始可能":   st.column_config.TextColumn(
+                "迎え開始可能", width="small",
+                help="自宅/学校に迎えに行ける最早時刻（HH:MM）。空欄=制約なし",
+            ),
+            "迎えリミット":   st.column_config.TextColumn(
+                "迎えリミット", width="small",
+                help="自宅/学校に迎えに行く最遅時刻（HH:MM）",
+            ),
+            "利用開始時間":   st.column_config.TextColumn(
+                "利用開始時間", width="small",
+                help="施設到着の目標時刻（HH:MM）= カレンダー左側の時間",
+            ),
+            "利用終了時間":   st.column_config.TextColumn(
+                "利用終了時間", width="small",
+                help="施設を出発できる時刻（HH:MM）= カレンダー右側の時間",
+            ),
+            "送り到着リミット": st.column_config.TextColumn(
+                "送り到着リミット", width="small",
+                help="自宅に届ける最遅時刻（HH:MM）。空欄=制約なし",
+            ),
+            "_uid": st.column_config.TextColumn("_uid", disabled=True),
         },
-        disabled=["店舗","氏名","サービス","住所","車椅子","迎えリミット","送り目標","_uid"],
-        column_order=["出席","店舗","氏名","サービス","住所","車椅子","迎えリミット","送り目標"],
-        key="attendance_editor",
+        column_order=[
+            "出席", "店舗", "氏名", "サービス", "車椅子",
+            "迎え開始可能", "迎えリミット", "利用開始時間", "利用終了時間", "送り到着リミット",
+        ],
+        disabled=["店舗", "氏名", "サービス", "車椅子"],
+        key="user_editor_v6",
     )
 
-    attending_ids   = set(edited_attend.loc[edited_attend["出席"] == True, "_uid"].tolist())
-    attending_users = [u for u in filtered_users if u.user_id in attending_ids]
+    # エディタ結果から User を再構築
+    attending_users = _reconstruct_users_from_editor(edited_user_df, all_users)
 
-    # スタッフ確認
-    st.markdown("#### 👤 出勤スタッフ最終確認")
-    staff_df = pd.DataFrame([{
-        "出勤":   True,
-        "店舗":   s.shop,
-        "氏名":   s.name,
-        "優先度": s.priority,
-        "運転":   "✅" if s.can_drive else "❌",
-        "出勤時間": min_to_hhmm(s.shift_start) if s.shift_start else "終日",
-        "退勤時間": min_to_hhmm(s.shift_end)   if s.shift_end   else "終日",
-        "_sid":   s.staff_id,
-    } for s in sorted(filtered_staff, key=lambda x: (x.shop, x.priority))])
+    # ──────────────────────────────────────────────────────────
+    # スタッフテーブル（カレンダー連動チェック + 運転可否・時間編集可能）
+    # ──────────────────────────────────────────────────────────
+    st.markdown("#### 👤 スタッフ")
+    st.caption(
+        "✅ チェック = 本日出勤。「運転可否」「出勤時間」「退勤時間」をUI上で直接変更できます。"
+    )
 
-    edited_staff = st.data_editor(
+    staff_df = _build_staff_editor_df(all_staff, calendar_data, target_date)
+
+    edited_staff_df = st.data_editor(
         staff_df,
         use_container_width=True,
         hide_index=True,
         column_config={
-            "出勤":     st.column_config.CheckboxColumn("出勤", width="small"),
-            "店舗":     st.column_config.TextColumn("店舗",  width="small"),
-            "氏名":     st.column_config.TextColumn("氏名",  width="medium"),
-            "優先度":   st.column_config.NumberColumn("優先度",  width="small"),
-            "運転":     st.column_config.TextColumn("運転可否", width="small"),
-            "出勤時間": st.column_config.TextColumn("出勤", width="small"),
-            "退勤時間": st.column_config.TextColumn("退勤", width="small"),
-            "_sid":     st.column_config.TextColumn("_sid", disabled=True),
+            "出勤":     st.column_config.CheckboxColumn("出勤",   width="small"),
+            "店舗":     st.column_config.TextColumn("店舗",       width="small"),
+            "氏名":     st.column_config.TextColumn("氏名",       width="medium"),
+            "優先度":   st.column_config.NumberColumn("優先度",   width="small"),
+            "運転可否": st.column_config.CheckboxColumn(
+                "運転",
+                width="small",
+                help="今日だけ運転不可にする場合はチェックを外してください",
+            ),
+            "出勤時間": st.column_config.TextColumn(
+                "出勤時間",
+                width="small",
+                help="HH:MM 形式（例: 09:00）。変更するとVRPの稼働時間に反映されます。",
+            ),
+            "退勤時間": st.column_config.TextColumn(
+                "退勤時間",
+                width="small",
+                help="HH:MM 形式（例: 18:00）。変更するとVRPの稼働時間に反映されます。",
+            ),
+            "_sid": st.column_config.TextColumn("_sid", disabled=True),
         },
-        disabled=["店舗","氏名","優先度","運転","出勤時間","退勤時間","_sid"],
-        column_order=["出勤","店舗","氏名","優先度","運転","出勤時間","退勤時間"],
-        key="staff_editor",
+        column_order=["出勤", "店舗", "氏名", "優先度", "運転可否", "出勤時間", "退勤時間"],
+        disabled=["店舗", "氏名", "優先度"],
+        key="staff_editor_v6",
     )
 
-    attending_sids  = set(edited_staff.loc[edited_staff["出勤"] == True, "_sid"].tolist())
-    attending_staff = [s for s in filtered_staff if s.staff_id in attending_sids]
-    active_vehicles = [v for v in all_vehicles if any(s.shop == v.shop for s in attending_staff)]
+    # エディタ結果から Staff を再構築
+    attending_staff  = _reconstruct_staff_from_editor(edited_staff_df, all_staff)
+    active_vehicles  = [v for v in all_vehicles if any(s.shop == v.shop for s in attending_staff)]
 
-    # サマリー
+    # ── サマリーメトリクス ──
+    n_attend  = len(attending_users)
+    n_absent  = len(all_users) - n_attend
+    n_staff   = len(attending_staff)
+    n_no_drv  = sum(1 for s in attending_staff if not s.can_drive)
+
     col_a, col_b, col_c, col_d = st.columns(4)
-    col_a.metric("本日 出席利用者", f"{len(attending_users)} 名")
-    col_b.metric("本日 出勤スタッフ", f"{len(attending_staff)} 名")
-    col_c.metric("稼働車両", f"{len(active_vehicles)} 台")
-    col_d.metric("欠席",
-                 f"{len(filtered_users) - len(attending_users)} 名",
-                 delta=f"-{len(filtered_users) - len(attending_users)}" if len(filtered_users) != len(attending_users) else None,
-                 delta_color="inverse")
+    col_a.metric("本日 出席利用者",   f"{n_attend} 名")
+    col_b.metric("欠席",              f"{n_absent} 名",
+                 delta=f"-{n_absent}" if n_absent else None, delta_color="inverse")
+    col_c.metric("出勤スタッフ",      f"{n_staff} 名")
+    col_d.metric("稼働車両",          f"{len(active_vehicles)} 台")
+
+    if n_no_drv:
+        st.caption(f"※ 出勤スタッフのうち {n_no_drv}名 は運転不可として配車から除外されます")
 
     st.divider()
 
     # ================================================================
-    # STEP 3: 最適化実行
+    # STEP 3: 最適化実行 → 結果表示 → ダウンロード
     # ================================================================
-    step_header(3, "最適化の実行", "迎え便・送り便を同時に計算します")
+    step_header(3, "最適化して送迎ルートを確認する",
+                "編集済みの内容でVRPを実行し、Excelでダウンロードできます")
 
-    if len(attending_users) == 0:
+    if n_attend == 0:
         st.warning("出席利用者が0名です。STEP 2 で確認してください。")
         return
 
@@ -2712,14 +2984,15 @@ def main():
         st.error(e)
 
     run_btn = st.button(
-        f"🚀　{target_date.strftime('%m/%d')} の送迎ルートを最適化する　（{len(attending_users)}名）",
+        f"🚀　{target_date.strftime('%m/%d')} の送迎ルートを最適化する　"
+        f"（利用者{n_attend}名 / スタッフ{n_staff}名）",
         disabled=bool(errors),
         type="primary",
         use_container_width=True,
     )
 
     if run_btn:
-        with st.spinner(f"🔄 {target_date.strftime('%m/%d')} の迎え便・送り便を同時最適化中..."):
+        with st.spinner(f"🔄 迎え便・送り便を同時最適化中..."):
             pickup_routes  = run_all_shops(
                 attending_users, active_vehicles, attending_staff,
                 TripType.PICKUP,  pu_start, pu_limit,
@@ -2728,27 +3001,18 @@ def main():
                 attending_users, active_vehicles, attending_staff,
                 TripType.DROPOFF, do_start, do_limit,
             )
-
         st.session_state.update({
             "pickup_routes":  pickup_routes,
             "dropoff_routes": dropoff_routes,
             "result_date":    target_date,
         })
-        n_pu = len(pickup_routes)
-        n_do = len(dropoff_routes)
         st.success(
-            f"✅ 最適化完了！　迎え便 **{n_pu}** ルート　送り便 **{n_do}** ルート"
+            f"✅ 最適化完了！　迎え便 **{len(pickup_routes)}** ルート　"
+            f"送り便 **{len(dropoff_routes)}** ルート"
         )
 
-    st.divider()
-
-    # ================================================================
-    # STEP 4: 結果表示・ダウンロード
-    # ================================================================
-    step_header(4, "結果の確認とダウンロード", "送迎ルートを確認して印刷・配布")
-
     if "pickup_routes" not in st.session_state:
-        st.info("👆 STEP 3 で最適化を実行すると結果が表示されます")
+        st.info("👆 上のボタンを押すとルートが表示されます")
         return
 
     pickup_routes  = st.session_state["pickup_routes"]
@@ -2760,12 +3024,11 @@ def main():
         st.error("ルートを生成できませんでした。データを確認してください。")
         return
 
-    # メトリクス
+    # ── メトリクス ──
     total_pu   = sum(len(r.stops) for r in pickup_routes)
     total_do   = sum(len(r.stops) for r in dropoff_routes)
     wc_count   = sum(1 for r in pickup_routes for s in r.stops if s["user"].wheelchair)
     shops_used = sorted(set(r.shop for r in all_routes))
-
     metric_row([
         (total_pu,        "名", "迎え便 乗車合計"),
         (total_do,        "名", "送り便 乗車合計"),
@@ -2773,101 +3036,88 @@ def main():
         (len(shops_used), "店", "稼働店舗数"),
     ])
 
-    # 制約検証
+    # ── 制約検証 ──
     with st.expander("🔍 制約条件 検証サマリー", expanded=False):
         forbidden = checker.get_forbidden_pairs(attending_users)
         all_ok    = True
-
         for label, routes in [("迎え便", pickup_routes), ("送り便", dropoff_routes)]:
             st.markdown(f"**{label}**")
             for route in routes:
-                uin      = [s["user"] for s in route.stops]
-                ok_cap   = len(uin) <= route.vehicle.capacity
-                ok_wc    = not (any(u.wheelchair for u in uin) and not route.vehicle.wheelchair_ok)
-                ok_incp  = not any(
+                uin     = [s["user"] for s in route.stops]
+                ok_cap  = len(uin) <= route.vehicle.capacity
+                ok_wc   = not (any(u.wheelchair for u in uin) and not route.vehicle.wheelchair_ok)
+                ok_incp = not any(
                     tuple(sorted([u1.user_id, u2.user_id])) in forbidden
                     for i, u1 in enumerate(uin) for u2 in uin[i+1:]
                 )
-                ok_drv   = route.driver is not None and route.driver.can_drive
-                ok_shop  = all(u.shop == route.shop for u in uin)
+                ok_drv  = route.driver is not None and route.driver.can_drive
+                ok_shop = all(u.shop == route.shop for u in uin)
+                ok_tw   = all(s["arrival_min"] <= s["user"].pickup_latest
+                              for s in route.stops) if route.trip_type == TripType.PICKUP else True
+                all_ok  = all_ok and all([ok_cap, ok_wc, ok_incp, ok_drv, ok_shop])
 
-                # TimeWindow チェック（迎え便のみ）
-                if route.trip_type == TripType.PICKUP:
-                    ok_tw = all(s["arrival_min"] <= s["user"].pickup_latest for s in route.stops)
-                else:
-                    ok_tw = True  # 送り便は目安のみ
-
-                all_ok = all_ok and all([ok_cap, ok_wc, ok_incp, ok_drv, ok_shop])
-
-                def st_icon(ok): return '<span class="ok">✅</span>' if ok else '<span class="fail">❌ 違反</span>'
+                def st_icon(ok):
+                    return '<span class="ok">✅</span>' if ok else '<span class="fail">❌</span>'
                 dn = route.driver.name if route.driver else "未定"
                 st.markdown(
-                    f"　**{route.shop} - {route.vehicle.name}** ({len(uin)}/{route.vehicle.capacity}名)　"
-                    f"定員:{st_icon(ok_cap)}　車椅子:{st_icon(ok_wc)}　"
-                    f"同乗不可:{st_icon(ok_incp)}　混載禁止:{st_icon(ok_shop)}　"
-                    f"TimeWindow:{st_icon(ok_tw)}　"
-                    f"運転者:{dn} {st_icon(ok_drv)}",
+                    f"　**{route.shop} - {route.vehicle.name}**"
+                    f"（{len(uin)}/{route.vehicle.capacity}名）　"
+                    f"定員:{st_icon(ok_cap)} 車椅子:{st_icon(ok_wc)} "
+                    f"同乗不可:{st_icon(ok_incp)} 混載:{st_icon(ok_shop)} "
+                    f"TW:{st_icon(ok_tw)} 運転:{dn} {st_icon(ok_drv)}",
                     unsafe_allow_html=True,
                 )
         if all_ok:
-            st.success("🎉 全制約条件をクリアしています！")
+            st.success("🎉 全制約条件クリア！")
 
-    # 結果テーブル（タブ）
+    # ── 結果テーブル ──
     st.markdown("#### 📋 送迎ルート一覧")
     tab_pu, tab_do = st.tabs(["▶ 迎え便", "◀ 送り便"])
-
     col_cfg = {
         "順番":     st.column_config.NumberColumn(width="small"),
         "到着予定": st.column_config.TextColumn(width="small"),
         "車椅子":   st.column_config.TextColumn(width="small"),
         "優先度":   st.column_config.NumberColumn(width="small"),
     }
-
     with tab_pu:
         df_pu = routes_to_dataframe(pickup_routes)
-        if not df_pu.empty:
-            st.dataframe(df_pu, use_container_width=True, hide_index=True, column_config=col_cfg)
-        else:
-            st.info("迎え便のルートがありません")
-
+        st.dataframe(df_pu, use_container_width=True, hide_index=True, column_config=col_cfg) \
+            if not df_pu.empty else st.info("迎え便のルートがありません")
     with tab_do:
         df_do = routes_to_dataframe(dropoff_routes)
-        if not df_do.empty:
-            st.dataframe(df_do, use_container_width=True, hide_index=True, column_config=col_cfg)
-        else:
-            st.info("送り便のルートがありません")
+        st.dataframe(df_do, use_container_width=True, hide_index=True, column_config=col_cfg) \
+            if not df_do.empty else st.info("送り便のルートがありません")
 
-    # タイムラインプレビュー（迎え便のみ）
+    # ── タイムライン ──
     with st.expander("🕐 タイムラインプレビュー（迎え便）", expanded=False):
         for route in sorted(pickup_routes, key=lambda r: r.shop):
             dn = route.driver.name if route.driver else "未定"
-            st.markdown(f"**{route.shop} - {route.vehicle.name}** 　運転: {dn}")
+            st.markdown(f"**{route.shop} - {route.vehicle.name}**　運転: {dn}")
             html = ""
             for stop in route.stops:
                 h, m = divmod(stop["arrival_min"], 60)
                 wc   = "♿ " if stop["user"].wheelchair else ""
                 tw   = min_to_hhmm(stop["user"].pickup_latest)
-                html += f"""
-                <div class="timeline-item">
-                  <div class="timeline-dot"></div>
-                  <div class="timeline-time">{h:02d}:{m:02d}</div>
-                  <div>
-                    <div class="timeline-name">{wc}{stop["user"].name}</div>
-                    <div class="timeline-detail">{stop["address"]}　リミット: {tw}</div>
-                  </div>
-                </div>
-                """
+                html += (
+                    f'<div class="timeline-item">'
+                    f'<div class="timeline-dot"></div>'
+                    f'<div class="timeline-time">{h:02d}:{m:02d}</div>'
+                    f'<div>'
+                    f'<div class="timeline-name">{wc}{stop["user"].name}</div>'
+                    f'<div class="timeline-detail">{stop["address"]}　リミット: {tw}</div>'
+                    f'</div></div>'
+                )
             st.markdown(html, unsafe_allow_html=True)
 
-    # ダウンロード
+    # ── ダウンロード ──
     st.markdown("<br>", unsafe_allow_html=True)
     col_dl, _ = st.columns([1, 2])
     with col_dl:
         excel_bytes = build_excel_output(pickup_routes, dropoff_routes, result_date)
         date_fname  = result_date.strftime("%Y%m%d") if result_date else "送迎ルート"
-        ext   = "xlsx" if OPENPYXL_AVAILABLE else "csv"
-        mime  = ("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                 if OPENPYXL_AVAILABLE else "text/csv")
+        ext  = "xlsx" if OPENPYXL_AVAILABLE else "csv"
+        mime = ("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                if OPENPYXL_AVAILABLE else "text/csv")
         st.download_button(
             label=f"📥 送迎ルート表をダウンロード（{date_fname}）",
             data=excel_bytes,
@@ -2875,17 +3125,18 @@ def main():
             mime=mime,
             use_container_width=True,
         )
-        st.caption("迎え便・送り便が1ファイルの2シートで出力されます（印刷向けA4横）")
+        st.caption("迎え便・送り便を1ファイルの2シートで出力します（A4横向き）")
 
     st.divider()
 
-    # 地図表示
+    # ── 地図 ──
     st.markdown("#### 🗺️ 送迎ルートマップ")
     tab_map1, tab_map2 = st.tabs(["▶ 迎え便", "◀ 送り便"])
     with tab_map1:
         render_map(pickup_routes)
     with tab_map2:
         render_map(dropoff_routes)
+
 
 
 if __name__ == "__main__":
